@@ -1,0 +1,25 @@
+{
+  "product": "NUCAPS-EDR",
+  "product_version": "v3r2",
+  "platform": "NOAA-20",
+  "instruments": ["CrIS", "ATMS"],
+  "source_file": "NUCAPS-EDR_v3r2_j01_s202502030040589_e202502030041287_c202502030151310.nc",
+  "source_url": "https://noaa-nesdis-n20-pds.s3.amazonaws.com/NUCAPS-EDR/2025/02/03/NUCAPS-EDR_v3r2_j01_s202502030040589_e202502030041287_c202502030151310.nc",
+  "sha256": "79F4A4112CD795C2D528B1C24630E8797366D0481B6521F2225574E7DD23E822",
+  "target": {
+    "observation_time_utc": "2023-02-03T01:13:27.900Z",
+    "latitude_deg": -45.4019355774,
+    "longitude_deg": -168.3135986328
+  },
+  "selected_profile": {
+    "for_index": 4,
+    "observation_time_utc": "2025-02-03T00:40:59.783001Z",
+    "latitude_deg": -45.3448448181,
+    "longitude_deg": -168.3952484131,
+    "great_circle_distance_km": 8.9987,
+    "angular_distance_deg": 0.0809069353,
+    "quality_flag": 0,
+    "valid_temperature_level_count": 97
+  },
+  "usage": "Archived data resource only; not used by the simplified correction workflow."
+}

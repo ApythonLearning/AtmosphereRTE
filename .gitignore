@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+arte_atmosphere_workspace/
+.arte_atmosphere_recent.json
+.pytest_cache/
+.coverage
+
+# HAPI/HITRAN local line-table cache (downloaded or imported)
+resources/data/gas_absorption/*.data
+resources/data/gas_absorption/*.header
