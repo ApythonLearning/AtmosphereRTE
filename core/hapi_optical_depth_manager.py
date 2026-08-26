@@ -710,6 +710,163 @@ class NucapsAtmosphericProfileReader:
         )
 
 
+class LayeredAtmosphericProfileCsvReader:
+    """Read an already normalized ARTE 35-layer representative profile."""
+
+    @classmethod
+    def inspect(cls, source_path: str | Path) -> dict[str, Any]:
+        profile = cls.read(source_path, 0)
+        return {
+            "source_path": str(profile.source_path),
+            "source_type": "ARTE_35_LAYER_CSV",
+            "profile_count": 1,
+            "latitude_deg": np.asarray([profile.latitude_deg]),
+            "longitude_deg": np.asarray([profile.longitude_deg]),
+            "quality_flag": np.asarray([profile.quality_flag]),
+            "time_ms": np.asarray([np.nan]),
+            "observation_time_utc": [profile.observation_time_utc],
+            "valid_level_count": np.asarray([profile.source_level_count]),
+            "gas_names": profile.gas_names,
+        }
+
+    @classmethod
+    def read(cls, source_path: str | Path, for_index: int = 0) -> LayeredAtmosphericProfile:
+        source = Path(source_path).expanduser().resolve()
+        if int(for_index) != 0:
+            raise IndexError("35层CSV廓线只有索引0。")
+        if not source.is_file():
+            raise FileNotFoundError(f"35层大气廓线不存在：{source}")
+        with source.open("r", encoding="utf-8-sig") as stream:
+            header = stream.readline().strip()
+        columns = tuple(item.strip() for item in header.split(","))
+        values = np.loadtxt(source, delimiter=",", skiprows=1, ndmin=2)
+        expected_layers = len(LayeredAtmosphereSolver.LAYER_HEIGHT_KM)
+        if values.shape != (expected_layers, len(columns)):
+            raise ValueError(
+                f"HAPI代表廓线必须是{expected_layers}层，且数据列须与表头一致。"
+            )
+        indices = {name: index for index, name in enumerate(columns)}
+        required = {"pressure(hPa)", "temperature(K)"}
+        if not required.issubset(indices):
+            raise ValueError("35层CSV缺少 pressure(hPa) 或 temperature(K)。")
+        pressure = np.asarray(values[:, indices["pressure(hPa)"]], dtype=float)
+        temperature = np.asarray(values[:, indices["temperature(K)"]], dtype=float)
+        if (
+            not np.isfinite(pressure).all()
+            or not np.isfinite(temperature).all()
+            or np.any(pressure <= 0.0)
+            or np.any(temperature <= 0.0)
+        ):
+            raise ValueError("35层CSV包含无效温度或气压。")
+        heights = np.asarray(LayeredAtmosphereSolver.LAYER_HEIGHT_KM, dtype=float)
+        boundaries = np.r_[0.0, np.cumsum(heights)]
+        default_mid = 0.5 * (boundaries[:-1] + boundaries[1:])
+        altitude = (
+            np.asarray(values[:, indices["altitude_mid(km)"]], dtype=float)
+            if "altitude_mid(km)" in indices
+            else default_mid
+        )
+        gas_columns: dict[str, np.ndarray] = {}
+        for name, index in indices.items():
+            if not name.startswith("column_") or "(" not in name:
+                continue
+            gas_name = name[len("column_") : name.index("(")].strip().upper()
+            if gas_name not in {gas.name for gas in ABSORBING_GASES}:
+                continue
+            column = np.asarray(values[:, index], dtype=float)
+            if np.isfinite(column).all() and np.all(column >= 0.0):
+                gas_columns[gas_name] = column
+        if not gas_columns:
+            raise ValueError("35层CSV没有可用于HAPI的气体分子柱密度列。")
+
+        metadata: dict[str, Any] = {}
+        sidecar = source.with_suffix(".json")
+        if sidecar.is_file():
+            try:
+                metadata = dict(json.loads(sidecar.read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                metadata = {}
+        return LayeredAtmosphericProfile(
+            source_path=source,
+            for_index=0,
+            observation_time_utc=str(metadata.get("observation_time_utc", "")),
+            latitude_deg=float(metadata.get("latitude_deg", np.nan)),
+            longitude_deg=float(metadata.get("longitude_deg", np.nan)),
+            quality_flag=int(metadata.get("quality_flag", 0)),
+            altitude_boundaries_km=boundaries,
+            altitude_mid_km=altitude,
+            pressure_hpa=pressure,
+            temperature_k=temperature,
+            gas_columns_molec_cm2=gas_columns,
+            gas_sources={
+                name: "大气廓线模式学习导出的35层分子柱密度"
+                for name in gas_columns
+            },
+            source_level_count=expected_layers,
+            source_top_altitude_km=float(boundaries[-1]),
+        )
+
+    @staticmethod
+    def nearest_valid_for(
+        inspection: dict[str, Any], latitude_deg: float, longitude_deg: float
+    ) -> int:
+        del inspection, latitude_deg, longitude_deg
+        return 0
+
+    @staticmethod
+    def profile_summary(inspection: dict[str, Any], for_index: int) -> dict[str, Any]:
+        if int(for_index) != 0:
+            raise IndexError("35层CSV廓线只有索引0。")
+        return {
+            "for_index": 0,
+            "observation_time_utc": str(
+                list(inspection.get("observation_time_utc", [""]))[0]
+            ),
+            "latitude_deg": float(np.asarray(inspection["latitude_deg"])[0]),
+            "longitude_deg": float(np.asarray(inspection["longitude_deg"])[0]),
+            "quality_flag": int(np.asarray(inspection["quality_flag"])[0]),
+            "valid_level_count": int(np.asarray(inspection["valid_level_count"])[0]),
+        }
+
+
+class AtmosphericProfileReader:
+    """Dispatch NUCAPS products and learned 35-layer CSV modes."""
+
+    @staticmethod
+    def reader_for(source_path: str | Path) -> Any:
+        source = Path(source_path)
+        if source.suffix.lower() == ".csv":
+            return LayeredAtmosphericProfileCsvReader
+        return NucapsAtmosphericProfileReader
+
+    @classmethod
+    def inspect(cls, source_path: str | Path) -> dict[str, Any]:
+        return cls.reader_for(source_path).inspect(source_path)
+
+    @classmethod
+    def read(cls, source_path: str | Path, for_index: int) -> LayeredAtmosphericProfile:
+        return cls.reader_for(source_path).read(source_path, for_index)
+
+    @classmethod
+    def nearest_valid_for(
+        cls,
+        inspection: dict[str, Any],
+        latitude_deg: float,
+        longitude_deg: float,
+    ) -> int:
+        source = str(inspection.get("source_path", ""))
+        return cls.reader_for(source).nearest_valid_for(
+            inspection, latitude_deg, longitude_deg
+        )
+
+    @classmethod
+    def profile_summary(
+        cls, inspection: dict[str, Any], for_index: int
+    ) -> dict[str, Any]:
+        source = str(inspection.get("source_path", ""))
+        return cls.reader_for(source).profile_summary(inspection, for_index)
+
+
 class HapiOpticalDepthManager:
     """调用项目自带HAPI，生成求解器可直接使用的35层气体吸收光学厚度。"""
 
@@ -737,7 +894,7 @@ class HapiOpticalDepthManager:
         self.database_dir = Path(
             database_dir or application_dir / "resources" / "data" / "gas_absorption"
         ).resolve()
-        self.profile_reader = NucapsAtmosphericProfileReader()
+        self.profile_reader = AtmosphericProfileReader()
         self._hapi: Any | None = None
         self._table_sources: dict[str, Path] = {}
         self.set_table_sources(table_sources or {})
@@ -974,7 +1131,7 @@ class HapiOpticalDepthManager:
         progress = progress or (lambda _value, _maximum, _message: None)
         cancelled = cancelled or (lambda: False)
         self._check_cancelled(cancelled)
-        progress(0, 1, "正在读取并重映射NUCAPS大气廓线…")
+        progress(0, 1, "正在读取35层大气廓线…")
         profile_started = time.perf_counter()
         profile = self.profile_reader.read(profile_path, int(for_index))
         profile_seconds = time.perf_counter() - profile_started

@@ -33,8 +33,8 @@ from PySide6.QtWidgets import (
 )
 
 from core.hapi_optical_depth_manager import (
+    AtmosphericProfileReader,
     HapiOpticalDepthManager,
-    NucapsAtmosphericProfileReader,
 )
 from dialogs.window_controls import configure_resizable_dialog
 
@@ -43,6 +43,7 @@ class HapiOpticalDepthDialog(QDialog):
     """从NUCAPS廓线生成HAPI逐层吸收光学厚度。"""
 
     resultReady = Signal(dict)
+    batchResultReady = Signal(dict)
 
     def __init__(
         self,
@@ -63,6 +64,7 @@ class HapiOpticalDepthDialog(QDialog):
         self._stderr_buffer = ""
         self._pending_state = ""
         self._working = False
+        self._batch_profiles: list[dict[str, Any]] = []
 
         self.setWindowTitle("HITRAN 分层吸收光学厚度计算")
         if self.embedded:
@@ -101,6 +103,73 @@ class HapiOpticalDepthDialog(QDialog):
 
     def set_project_dir(self, project_dir: str | Path) -> None:
         self.project_dir = Path(project_dir).resolve()
+        if not self._working:
+            self._batch_profiles = []
+            self._update_start_button_text()
+
+    def set_profile_selection(self, source: str | Path, for_index: int) -> bool:
+        """Load a NUCAPS product or an exported learned representative profile."""
+        if self._working:
+            return False
+        self._batch_profiles = []
+        self._inspect_profile(Path(source).expanduser().resolve())
+        if self.inspection is None:
+            return False
+        loaded = Path(self.profile_path.text()).resolve()
+        if loaded != Path(source).expanduser().resolve():
+            return False
+        if for_index < self.for_index.minimum() or for_index > self.for_index.maximum():
+            return False
+        self.for_index.setValue(int(for_index))
+        self._update_start_button_text()
+        return True
+
+    def set_batch_profiles(self, profiles: list[dict[str, Any]]) -> bool:
+        """Prepare a sequential HAPI job using one spectral grid for all profiles."""
+        if self._working or not profiles:
+            return False
+        normalized: list[dict[str, Any]] = []
+        for position, item in enumerate(profiles):
+            source = Path(str(item.get("profile_path", ""))).expanduser().resolve()
+            if not source.is_file():
+                return False
+            normalized.append(
+                {
+                    "batch_index": int(item.get("batch_index", position)),
+                    "profile_path": str(source),
+                    "for_index": int(item.get("for_index", 0)),
+                }
+            )
+        first = normalized[0]
+        self._batch_profiles = []
+        self._inspect_profile(Path(first["profile_path"]))
+        if self.inspection is None or Path(self.profile_path.text()).resolve() != Path(
+            first["profile_path"]
+        ):
+            return False
+        self.for_index.setValue(int(first["for_index"]))
+        self._batch_profiles = normalized
+        self._update_profile_summary()
+        self._update_start_button_text()
+        self.result_summary.setText(
+            f"已装载{len(normalized)}个代表廓线。它们将采用相同波数网格顺序计算；"
+            "完成后结果会自动返回大气廓线模式库。"
+        )
+        return True
+
+    @property
+    def batch_profile_count(self) -> int:
+        return len(self._batch_profiles)
+
+    def _update_start_button_text(self) -> None:
+        if not hasattr(self, "start_button"):
+            return
+        if self._batch_profiles:
+            self.start_button.setText(
+                f"开始批量计算全部 {len(self._batch_profiles)} 个代表模式"
+            )
+        else:
+            self.start_button.setText("开始计算并保存到当前项目")
 
     def set_line_table_sources(self, sources: dict[str, str]) -> None:
         self.manager.set_table_sources(sources)
@@ -119,7 +188,7 @@ class HapiOpticalDepthDialog(QDialog):
         )
 
     def _build_profile_group(self) -> QGroupBox:
-        group = QGroupBox("NUCAPS大气廓线")
+        group = QGroupBox("大气廓线（NUCAPS或最终代表模式）")
         form = QFormLayout(group)
         form.setHorizontalSpacing(10)
         form.setVerticalSpacing(8)
@@ -158,9 +227,9 @@ class HapiOpticalDepthDialog(QDialog):
         self.for_index = QSpinBox()
         self.for_index.setRange(0, 0)
         self.for_index.valueChanged.connect(self._update_profile_summary)
-        form.addRow("NUCAPS FOR索引", self.for_index)
+        form.addRow("廓线/FOR索引", self.for_index)
 
-        self.profile_summary = QLabel("请选择NUCAPS NetCDF廓线文件。")
+        self.profile_summary = QLabel("请选择NUCAPS NetCDF或模式学习导出的35层CSV。")
         self.profile_summary.setWordWrap(True)
         self.profile_summary.setTextInteractionFlags(
             self.profile_summary.textInteractionFlags()
@@ -398,17 +467,19 @@ class HapiOpticalDepthDialog(QDialog):
     def _browse_profile(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择NUCAPS大气廓线",
+            "选择大气廓线",
             self.profile_path.text(),
-            "NUCAPS NetCDF (*.nc *.nc4);;所有文件 (*)",
+            "大气廓线 (*.nc *.nc4 *.csv);;NUCAPS NetCDF (*.nc *.nc4);;35层CSV (*.csv);;所有文件 (*)",
         )
         if path:
+            self._batch_profiles = []
             self._inspect_profile(Path(path))
+            self._update_start_button_text()
 
     def _inspect_profile(self, source: Path) -> None:
         try:
-            inspection = NucapsAtmosphericProfileReader.inspect(source)
-            nearest = NucapsAtmosphericProfileReader.nearest_valid_for(
+            inspection = AtmosphericProfileReader.inspect(source)
+            nearest = AtmosphericProfileReader.nearest_valid_for(
                 inspection,
                 self.target_latitude.value(),
                 self.target_longitude.value(),
@@ -427,10 +498,10 @@ class HapiOpticalDepthDialog(QDialog):
 
     def _match_nearest_profile(self) -> None:
         if self.inspection is None:
-            QMessageBox.information(self, "匹配大气廓线", "请先选择NUCAPS廓线文件。")
+            QMessageBox.information(self, "匹配大气廓线", "请先选择有效的大气廓线文件。")
             return
         try:
-            nearest = NucapsAtmosphericProfileReader.nearest_valid_for(
+            nearest = AtmosphericProfileReader.nearest_valid_for(
                 self.inspection,
                 self.target_latitude.value(),
                 self.target_longitude.value(),
@@ -444,17 +515,23 @@ class HapiOpticalDepthDialog(QDialog):
         if self.inspection is None:
             return
         try:
-            summary = NucapsAtmosphericProfileReader.profile_summary(
+            summary = AtmosphericProfileReader.profile_summary(
                 self.inspection, self.for_index.value()
             )
         except Exception as exc:  # noqa: BLE001
             self.profile_summary.setText(str(exc))
             return
         self.profile_summary.setText(
-            f"FOR {summary['for_index']}；{summary['observation_time_utc']}；"
+            f"索引 {summary['for_index']}；{summary['observation_time_utc']}；"
             f"{summary['latitude_deg']:.7f}°, {summary['longitude_deg']:.7f}°；"
             f"Quality_Flag={summary['quality_flag']}；"
             f"有效温压层={summary['valid_level_count']}"
+            + (
+                f"\n批量模式：共{len(self._batch_profiles)}个最终代表廓线，"
+                "本页参数将统一应用于全部廓线。"
+                if self._batch_profiles
+                else ""
+            )
         )
 
     def _update_gas_table(self) -> None:
@@ -481,7 +558,7 @@ class HapiOpticalDepthDialog(QDialog):
         if self._working:
             return
         if self.inspection is None or not self.profile_path.text():
-            QMessageBox.information(self, "HAPI光学厚度计算", "请先选择有效的NUCAPS廓线。")
+            QMessageBox.information(self, "HAPI光学厚度计算", "请先选择有效的大气廓线。")
             return
         if self.wavenumber_max.value() <= self.wavenumber_min.value():
             QMessageBox.information(self, "HAPI光学厚度计算", "波数上限必须大于下限。")
@@ -511,15 +588,18 @@ class HapiOpticalDepthDialog(QDialog):
         self._job_dir.mkdir(parents=True, exist_ok=False)
         self._cancel_path = self._job_dir / "cancel.flag"
         request_path = self._job_dir / "request.json"
+        request = {
+            "hapi_path": str(self.manager.hapi_path),
+            "database_dir": str(self.manager.database_dir),
+            "table_sources": self.manager.export_table_sources(),
+            "cancel_path": str(self._cancel_path),
+            "arguments": arguments,
+        }
+        if self._batch_profiles:
+            request["batch_profiles"] = list(self._batch_profiles)
         request_path.write_text(
             json.dumps(
-                {
-                    "hapi_path": str(self.manager.hapi_path),
-                    "database_dir": str(self.manager.database_dir),
-                    "table_sources": self.manager.export_table_sources(),
-                    "cancel_path": str(self._cancel_path),
-                    "arguments": arguments,
-                },
+                request,
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -591,6 +671,8 @@ class HapiOpticalDepthDialog(QDialog):
             )
         elif event_type == "result":
             self._calculation_succeeded(event.get("result"))
+        elif event_type == "batch_result":
+            self._batch_calculation_succeeded(event.get("result"))
         elif event_type == "cancelled":
             self._calculation_cancelled(str(event.get("message", "计算已取消。")))
         elif event_type == "error":
@@ -618,6 +700,34 @@ class HapiOpticalDepthDialog(QDialog):
                 f"总光学厚度：{self.result_data.get('total_optical_depth_file', '')}"
             )
             self.resultReady.emit(dict(self.result_data))
+
+    @Slot(object)
+    def _batch_calculation_succeeded(self, result: object) -> None:
+        batch_result = dict(result) if isinstance(result, dict) else {}
+        results = list(batch_result.get("results", []))
+        failures = list(batch_result.get("failures", []))
+        self.result_data = batch_result
+        self._pending_state = "success"
+        elapsed = sum(
+            float(dict(item).get("performance", {}).get("total_seconds", 0.0))
+            for item in results
+            if isinstance(item, dict)
+        )
+        failure_text = ""
+        if failures:
+            details = "；".join(
+                f"模式{int(item.get('batch_index', -1)) + 1}：{item.get('message', '未知错误')}"
+                for item in failures[:5]
+            )
+            failure_text = f"\n失败{len(failures)}个：{details}"
+        first = dict(results[0]) if results else {}
+        self.result_summary.setText(
+            f"代表廓线批量计算完成：成功{len(results)}个，失败{len(failures)}个；"
+            f"统一网格{first.get('spectral_point_count', '-')}点；累计耗时{elapsed:.1f}秒。"
+            f"{failure_text}"
+        )
+        self._update_gas_table()
+        self.batchResultReady.emit(batch_result)
 
     @Slot(str)
     def _calculation_failed(self, message: str) -> None:
@@ -655,15 +765,23 @@ class HapiOpticalDepthDialog(QDialog):
             return
         self._working = False
         self.start_button.setEnabled(True)
+        self._update_start_button_text()
         self.cancel_button.setEnabled(False)
         self.close_button.setEnabled(True)
         if self._pending_state == "success":
             self.progress_bar.setValue(self.progress_bar.maximum())
-            self.progress_label.setText(
-                "计算完成，结果已应用到当前项目。"
-                if self.embedded
-                else "计算完成，可关闭窗口并应用到当前项目。"
-            )
+            if self._batch_profiles and isinstance(self.result_data, dict):
+                success_count = len(self.result_data.get("results", []))
+                failure_count = len(self.result_data.get("failures", []))
+                self.progress_label.setText(
+                    f"批量任务结束：成功{success_count}个，失败{failure_count}个。"
+                )
+            else:
+                self.progress_label.setText(
+                    "计算完成，结果已应用到当前项目。"
+                    if self.embedded
+                    else "计算完成，可关闭窗口并应用到当前项目。"
+                )
         elif self._pending_state == "failed":
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)

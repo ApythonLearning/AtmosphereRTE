@@ -45,6 +45,7 @@ from core.atmospheric_radiation_manager import (
 )
 from core.spectrum_validation_manager import SpectrumValidationManager
 from dialogs.absorption_preview_dialog import AbsorptionPreviewDialog
+from dialogs.atmospheric_pattern_dialog import AtmosphericPatternDialog
 from dialogs.atmospheric_spectrum_preview_dialog import AtmosphericSpectrumPreviewDialog
 from dialogs.hapi_optical_depth_dialog import HapiOpticalDepthDialog
 from dialogs.modis_preview_dialog import ModisPreviewDialog
@@ -179,12 +180,14 @@ class AtmosphereMainWindow(QMainWindow):
             "地球环境与大气辐射",
             "分层吸收光学厚度",
             "大气光谱验证",
+            "大气廓线模式学习",
         ])
         self.navigation.setFixedWidth(220)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_atmosphere_page())
         self.pages.addWidget(self._build_hapi_page())
         self.pages.addWidget(self._build_validation_page())
+        self.pages.addWidget(self._build_pattern_page())
         body.addWidget(self.navigation)
         body.addWidget(self.pages, 1)
         root_layout.addLayout(body, 1)
@@ -334,6 +337,7 @@ class AtmosphereMainWindow(QMainWindow):
             self.workspace, page, embedded=True
         )
         self.hapi_workbench.resultReady.connect(self._handle_hapi_result)
+        self.hapi_workbench.batchResultReady.connect(self._handle_hapi_batch_result)
         layout.addWidget(self.hapi_workbench)
         return scroll_page(page)
 
@@ -350,6 +354,21 @@ class AtmosphereMainWindow(QMainWindow):
         )
         layout.addWidget(self.validation_workbench)
         return page
+
+    def _build_pattern_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.pattern_workbench = AtmosphericPatternDialog(self.workspace, page)
+        self.pattern_workbench.opticalDepthReady.connect(
+            self._handle_pattern_optical_depth
+        )
+        self.pattern_workbench.statusMessage.connect(self._log)
+        self.pattern_workbench.exactCalculationRequested.connect(self._open_hapi)
+        self.pattern_workbench.exactProfileRequested.connect(self._open_hapi_profile)
+        self.pattern_workbench.batchProfilesRequested.connect(self._open_hapi_batch)
+        layout.addWidget(self.pattern_workbench)
+        return scroll_page(page)
 
     def _connect_navigation(self) -> None:
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
@@ -378,6 +397,8 @@ class AtmosphereMainWindow(QMainWindow):
             self.hapi_workbench.set_project_dir(self.workspace)
             if load_project:
                 self.hapi_workbench.set_line_table_sources({})
+        if hasattr(self, "pattern_workbench"):
+            self.pattern_workbench.set_project_dir(self.workspace)
         if load_project:
             return self._load_project(
                 self.workspace / self.PROJECT_FILENAME, silent=True
@@ -426,6 +447,7 @@ class AtmosphereMainWindow(QMainWindow):
                 "hapi": {
                     "external_line_table_sources": self.hapi_workbench.line_table_sources(),
                 },
+                "atmospheric_patterns": self.pattern_workbench.project_state(),
                 "optical_depth_corrections": self.corrections,
                 "latest_sample": self.latest_sample,
                 "latest_parameters": self.latest_parameters,
@@ -469,6 +491,7 @@ class AtmosphereMainWindow(QMainWindow):
             self.hapi_workbench.set_line_table_sources(
                 dict(hapi_settings.get("external_line_table_sources", {}))
             )
+            pattern_settings = dict(data.get("atmospheric_patterns", {}))
 
             self.land_temperature.setText(str(environment.get("land_temperature_file", "")))
             self.sea_temperature.setText(str(environment.get("sea_temperature_file", "")))
@@ -518,6 +541,10 @@ class AtmosphereMainWindow(QMainWindow):
             external_table_count = len(self.hapi_workbench.line_table_sources())
             if external_table_count:
                 restored.append(f"HAPI外部谱线 {external_table_count} 组")
+            if pattern_settings and self.pattern_workbench.restore_project_state(
+                pattern_settings
+            ):
+                restored.append("大气状态模式模型")
             cache_path = self._resolve_project_path(self.environment_cache.text())
             if cache_path is not None and cache_path.exists():
                 grid = self.modis.load_cache(cache_path)
@@ -885,14 +912,58 @@ class AtmosphereMainWindow(QMainWindow):
         try:
             self.radiation.atmosphere.load_absorption_optical_depth(path)
             self.absorption_file.setText(path)
+            profile_path = str(result.get("profile_file", ""))
+            if profile_path:
+                self.pattern_workbench.set_query_profile(profile_path)
             self.corrections = []
             self._log(f"HAPI 35层总光学厚度生成并加载：{path}")
             self._save_project(silent=True)
         except Exception as exc:  # noqa: BLE001
             self._show_error("加载 HAPI 计算结果失败", exc)
 
+    def _handle_pattern_optical_depth(
+        self, path: str, prediction: dict[str, Any]
+    ) -> None:
+        try:
+            self.radiation.atmosphere.load_absorption_optical_depth(path)
+            self.absorption_file.setText(path)
+            self.corrections = []
+            confidence = float(prediction.get("confidence", 0.0))
+            self._log(
+                f"大气状态模式插值光学厚度已加载：{path}；置信度={confidence:.1%}"
+            )
+            self._save_project(silent=True)
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("加载模式插值光学厚度失败", exc)
+
     def _open_hapi(self) -> None:
         self.navigation.setCurrentRow(1)
+
+    def _open_hapi_profile(self, source: str, for_index: int) -> None:
+        if self.hapi_workbench.set_profile_selection(source, for_index):
+            self.navigation.setCurrentRow(1)
+            self._log(f"已在HAPI工作台加载代表廓线：{source}；FOR={for_index}")
+        else:
+            self._log(f"代表廓线加载失败：{source}；FOR={for_index}")
+
+    def _open_hapi_batch(self, profiles: object) -> None:
+        batch_profiles = list(profiles) if isinstance(profiles, list) else []
+        if self.hapi_workbench.set_batch_profiles(batch_profiles):
+            self.navigation.setCurrentRow(1)
+            self._log(
+                f"已在HAPI工作台装载{len(batch_profiles)}个最终代表廓线；"
+                "请统一设置光谱网格后开始批量计算。"
+            )
+        else:
+            self._log("代表廓线批量任务装载失败；请确认廓线文件存在且当前没有计算任务。")
+
+    def _handle_hapi_batch_result(self, result: dict[str, Any]) -> None:
+        try:
+            complete = self.pattern_workbench.apply_batch_optical_depth_result(result)
+            if complete:
+                self._save_project(silent=True)
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("绑定代表模式光学厚度失败", exc)
 
     def _open_validation(self) -> None:
         self.navigation.setCurrentRow(2)

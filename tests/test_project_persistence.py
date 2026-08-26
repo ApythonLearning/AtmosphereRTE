@@ -58,6 +58,11 @@ class ProjectPersistenceTests(unittest.TestCase):
             self.assertEqual(second.workspace, workspace.resolve())
             self.assertTrue(second.hapi_workbench.embedded)
             self.assertTrue(second.validation_workbench.embedded)
+            self.assertEqual(second.navigation.count(), 4)
+            self.assertEqual(
+                second.navigation.item(3).text(), "大气廓线模式学习"
+            )
+            self.assertEqual(second.pattern_workbench.project_dir, workspace.resolve())
             self.assertTrue(second.hapi_workbench.close_button.isHidden())
             self.assertTrue(second.validation_workbench.close_button.isHidden())
             self.assertAlmostEqual(second.latitude.value(), 35.12345, places=5)

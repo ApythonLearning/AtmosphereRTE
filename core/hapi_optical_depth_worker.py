@@ -20,6 +20,67 @@ def _emit(event_type: str, **payload: Any) -> None:
     )
 
 
+def _calculate_batch(
+    manager: HapiOpticalDepthManager,
+    arguments: dict[str, Any],
+    profiles: list[dict[str, Any]],
+    cancel_path: Path,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    profile_count = len(profiles)
+    progress_scale = 1000
+    for position, profile_item in enumerate(profiles):
+        if cancel_path.exists():
+            raise HapiCalculationCancelled("HAPI代表廓线批量计算已取消。")
+
+        profile_arguments = dict(arguments)
+        profile_arguments["profile_path"] = str(profile_item["profile_path"])
+        profile_arguments["for_index"] = int(profile_item.get("for_index", 0))
+
+        def batch_progress(value: int, maximum: int, message: str) -> None:
+            fraction = float(value) / float(maximum) if maximum > 0 else 0.0
+            completed = int(round((position + max(0.0, min(fraction, 1.0))) * progress_scale))
+            _emit(
+                "progress",
+                value=completed,
+                maximum=max(profile_count * progress_scale, 1),
+                message=f"[{position + 1}/{profile_count}] {message}",
+            )
+
+        try:
+            result = manager.calculate(
+                **profile_arguments,
+                progress=batch_progress,
+                cancelled=cancel_path.exists,
+            )
+        except HapiCalculationCancelled:
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(
+                {
+                    "batch_index": int(profile_item.get("batch_index", position)),
+                    "profile_path": str(profile_item["profile_path"]),
+                    "message": str(exc) or type(exc).__name__,
+                }
+            )
+            continue
+        result["batch_index"] = int(profile_item.get("batch_index", position))
+        result["source_profile_path"] = str(profile_item["profile_path"])
+        results.append(result)
+        _emit(
+            "progress",
+            value=(position + 1) * progress_scale,
+            maximum=max(profile_count * progress_scale, 1),
+            message=f"已完成代表廓线 {position + 1}/{profile_count}。",
+        )
+    return {
+        "profile_count": profile_count,
+        "results": results,
+        "failures": failures,
+    }
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         _emit("error", message="HAPI worker缺少计算请求文件。")
@@ -42,10 +103,22 @@ def main() -> int:
                 message=str(message),
             )
 
+        arguments = dict(request["arguments"])
+        batch_profiles = list(request.get("batch_profiles", []))
+        if batch_profiles:
+            batch_result = _calculate_batch(
+                manager, arguments, batch_profiles, cancel_path
+            )
+            if not batch_result["results"]:
+                messages = "；".join(
+                    str(item.get("message", "未知错误"))
+                    for item in batch_result["failures"]
+                )
+                raise RuntimeError(f"全部代表廓线计算失败：{messages}")
+            _emit("batch_result", result=batch_result)
+            return 0
         result = manager.calculate(
-            **dict(request["arguments"]),
-            progress=progress,
-            cancelled=cancel_path.exists,
+            **arguments, progress=progress, cancelled=cancel_path.exists
         )
     except HapiCalculationCancelled as exc:
         _emit("cancelled", message=str(exc))

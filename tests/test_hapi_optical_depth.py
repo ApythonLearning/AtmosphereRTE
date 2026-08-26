@@ -5,6 +5,8 @@ import tempfile
 import unittest
 import json
 import importlib.util
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
@@ -19,9 +21,42 @@ from core.hapi_optical_depth_manager import (  # noqa: E402
     NucapsAtmosphericProfileReader,
 )
 from core.atmospheric_radiation_manager import LayeredAtmosphereSolver  # noqa: E402
+from core.hapi_optical_depth_worker import _calculate_batch  # noqa: E402
 
 
 class HapiOpticalDepthTests(unittest.TestCase):
+    def test_representative_batch_runs_sequentially_and_reports_failures(self) -> None:
+        calls: list[str] = []
+
+        class FakeManager:
+            @staticmethod
+            def calculate(**arguments: object) -> dict[str, object]:
+                profile_path = str(arguments["profile_path"])
+                calls.append(profile_path)
+                if profile_path.endswith("bad.csv"):
+                    raise ValueError("synthetic failure")
+                progress = arguments["progress"]
+                progress(1, 2, "half")  # type: ignore[operator]
+                progress(2, 2, "done")  # type: ignore[operator]
+                return {"total_optical_depth_file": profile_path + ".tau.csv"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            cancel_path = Path(directory) / "cancel.flag"
+            profiles = [
+                {"batch_index": 0, "profile_path": "first.csv", "for_index": 0},
+                {"batch_index": 1, "profile_path": "bad.csv", "for_index": 0},
+                {"batch_index": 2, "profile_path": "last.csv", "for_index": 0},
+            ]
+            with redirect_stdout(io.StringIO()):
+                result = _calculate_batch(
+                    FakeManager(), {"output_root": directory}, profiles, cancel_path
+                )
+
+        self.assertEqual(calls, ["first.csv", "bad.csv", "last.csv"])
+        self.assertEqual([item["batch_index"] for item in result["results"]], [0, 2])
+        self.assertEqual(result["failures"][0]["batch_index"], 1)
+        self.assertIn("synthetic failure", result["failures"][0]["message"])
+
     def test_import_local_hitran_table_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

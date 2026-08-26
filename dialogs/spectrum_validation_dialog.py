@@ -33,6 +33,11 @@ from dialogs.matplotlib_canvas import DebouncedFigureCanvas
 from dialogs.window_controls import configure_resizable_dialog
 
 
+PLOT_BACKGROUND = "#eef0f3"
+TEXT_COLOR = "#26313d"
+SPINE_COLOR = "#697886"
+
+
 AXIS_KINDS = {
     "自动识别": "auto",
     "波长（μm）": "wavelength_um",
@@ -207,7 +212,7 @@ class SpectrumValidationDialog(QDialog):
             "axes.unicode_minus": False,
         })
         self.figure = Figure(figsize=(10.6, 6.6), dpi=100)
-        self.figure.patch.set_facecolor("#253242")
+        self.figure.patch.set_facecolor(PLOT_BACKGROUND)
         self.canvas = DebouncedFigureCanvas(self.figure)
         toolbar = NavigationToolbar2QT(self.canvas, self)
         toolbar.setObjectName("plotNavigationToolbar")
@@ -336,7 +341,7 @@ class SpectrumValidationDialog(QDialog):
         self._style_axis(axis)
         axis.text(
             0.5, 0.5, "导入卫星产品并执行光谱验证",
-            transform=axis.transAxes, ha="center", va="center", color="#afc0cf", fontsize=14,
+            transform=axis.transAxes, ha="center", va="center", color=SPINE_COLOR, fontsize=14,
             fontfamily="Microsoft YaHei",
         )
         axis.set_xticks([])
@@ -347,8 +352,8 @@ class SpectrumValidationDialog(QDialog):
         self.figure.clear()
         overlay, residual = self.figure.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [2.2, 1.0]})
         wavelength = result["wavelength_um"]
-        overlay.plot(wavelength, result["observed"], color="#62b6ff", linewidth=1.2, label="Satellite product")
-        overlay.plot(wavelength, result["simulated"], color="#ffb000", linewidth=1.1, label="ARTE Atmosphere simulation")
+        overlay.plot(wavelength, result["observed"], color="#1672b8", linewidth=1.2, label="Satellite product")
+        overlay.plot(wavelength, result["simulated"], color="#d97706", linewidth=1.1, label="ARTE Atmosphere simulation")
         quantity = str(self.atmospheric_result.get("spectral_quantity", "irradiance"))
         overlay.set_ylabel(
             r"Spectral radiance (W m$^{-2}$ sr$^{-1}$ $\mu$m$^{-1}$)"
@@ -358,9 +363,9 @@ class SpectrumValidationDialog(QDialog):
         overlay.set_title("Detector-received atmospheric radiative-transfer spectrum validation")
         legend = overlay.legend(loc="best", frameon=False)
         for label in legend.get_texts():
-            label.set_color("#dce6f2")
-        residual.axhline(0.0, color="#8fa5ba", linewidth=0.8)
-        residual.plot(wavelength, result["residual"], color="#ff5c8a", linewidth=0.9)
+            label.set_color(TEXT_COLOR)
+        residual.axhline(0.0, color=SPINE_COLOR, linewidth=0.8)
+        residual.plot(wavelength, result["residual"], color="#c43c64", linewidth=0.9)
         residual.set_xlabel(r"Wavelength $\lambda$ ($\mu$m)")
         residual.set_ylabel("Sim − Obs")
         for axis in (overlay, residual):
@@ -369,13 +374,13 @@ class SpectrumValidationDialog(QDialog):
         self.canvas.draw_idle()
 
     def _style_axis(self, axis: Any) -> None:
-        axis.set_facecolor("#2c3b4d")
-        axis.tick_params(which="both", direction="in", top=True, right=True, colors="#dce6f2")
-        axis.xaxis.label.set_color("#dce6f2")
-        axis.yaxis.label.set_color("#dce6f2")
-        axis.title.set_color("#dce6f2")
+        axis.set_facecolor(PLOT_BACKGROUND)
+        axis.tick_params(which="both", direction="in", top=True, right=True, colors=TEXT_COLOR)
+        axis.xaxis.label.set_color(TEXT_COLOR)
+        axis.yaxis.label.set_color(TEXT_COLOR)
+        axis.title.set_color(TEXT_COLOR)
         for spine in axis.spines.values():
-            spine.set_color("#8fa5ba")
+            spine.set_color(SPINE_COLOR)
 
     def _update_metrics(self, metrics: dict[str, Any]) -> None:
         for row, key in enumerate(METRIC_LABELS):
