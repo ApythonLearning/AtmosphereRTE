@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -127,6 +129,38 @@ class AtmosphericPatternTests(unittest.TestCase):
             result = manager.predict(extreme)
             self.assertTrue(result["out_of_distribution"])
             self.assertTrue(result["requires_hapi"])
+
+    def test_nucaps_query_dispatches_selected_for_to_35_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "NUCAPS-EDR_test.nc"
+            source.touch()
+            altitude = np.linspace(0.5, 96.0, 35)
+            profile = SimpleNamespace(
+                source_path=source,
+                for_index=17,
+                observation_time_utc="2025-02-03T00:40:58Z",
+                latitude_deg=-45.72,
+                longitude_deg=-173.95,
+                quality_flag=0,
+                altitude_mid_km=altitude,
+                pressure_hpa=1013.25 * np.exp(-altitude / 7.2),
+                temperature_k=288.0 - 5.5 * np.minimum(altitude, 11.0),
+                gas_names=["H2O", "O3"],
+                gas_columns_molec_cm2={
+                    "H2O": 2.0e23 * np.exp(-altitude / 2.0),
+                    "O3": 2.0e18 * np.exp(-((altitude - 25.0) / 10.0) ** 2),
+                },
+            )
+            with patch(
+                "core.hapi_optical_depth_manager.NucapsAtmosphericProfileReader.read",
+                return_value=profile,
+            ) as read:
+                record = AtmosphericPatternManager.read_profile(source, for_index=17)
+
+            read.assert_called_once_with(source.resolve(), 17)
+            self.assertEqual(record.values.shape, (35, 5))
+            self.assertEqual(record.metadata["source_type"], "NUCAPS")
+            self.assertEqual(record.metadata["for_index"], 17)
 
     def test_gfs_library_learns_profiles_before_exporting_final_modes(self) -> None:
         try:

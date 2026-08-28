@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,8 @@ import pandas as pd
 
 
 SUPPORTED_SPECTRUM_EXTENSIONS = {".csv", ".txt", ".dat", ".npz", ".nc", ".nc4", ".h5", ".hdf5"}
+CLOUD_FIT_WINDOWS_UM = ((8.0, 9.2), (10.2, 12.5))
+NUCAPS_CLOUD_PRIOR_RELATIVE_WEIGHT = 0.05
 
 class SpectrumValidationManager:
     """读取异构光谱并在共同波长网格上进行定量验证。"""
@@ -23,15 +26,85 @@ class SpectrumValidationManager:
     )
 
     @staticmethod
-    def three_point_hamming(values: np.ndarray) -> np.ndarray:
-        """对一维光谱执行归一化三点Hamming切趾。"""
+    def three_point_hamming(
+        values: np.ndarray,
+        coordinate: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """执行CrIS SDR规定的三点Hamming切趾。
+
+        NOAA CrIS SDR使用 ``[0.23, 0.54, 0.23]``。提供波数坐标时会在
+        CrIS三个独立谱段的间隙处分段，防止LW/MW/SW边界相互卷积。
+        """
         spectrum = np.asarray(values, dtype=float).reshape(-1)
         if spectrum.size < 3:
             return spectrum.copy()
-        weights = np.hamming(3)
-        weights /= np.sum(weights)
-        padded = np.pad(spectrum, (1, 1), mode="edge")
-        return np.convolve(padded, weights, mode="valid")
+        weights = np.asarray([0.23, 0.54, 0.23], dtype=float)
+        if coordinate is None:
+            padded = np.pad(spectrum, (1, 1), mode="edge")
+            return np.convolve(padded, weights, mode="valid")
+        spectral_coordinate = np.asarray(coordinate, dtype=float).reshape(-1)
+        if spectral_coordinate.size != spectrum.size:
+            raise ValueError("Hamming切趾的光谱坐标和值长度不一致。")
+        gaps = np.abs(np.diff(spectral_coordinate))
+        finite_positive = gaps[np.isfinite(gaps) & (gaps > 0.0)]
+        if finite_positive.size == 0:
+            padded = np.pad(spectrum, (1, 1), mode="edge")
+            return np.convolve(padded, weights, mode="valid")
+        # 取较小90%的中位数估计通道间隔，避免两个谱段大间隙抬高阈值。
+        upper_spacing = float(np.percentile(finite_positive, 90.0))
+        nominal_spacing = float(np.median(finite_positive[finite_positive <= upper_spacing]))
+        boundaries = np.flatnonzero(gaps > 3.0 * nominal_spacing) + 1
+        result = spectrum.copy()
+        starts = np.r_[0, boundaries]
+        stops = np.r_[boundaries, spectrum.size]
+        for start, stop in zip(starts, stops):
+            segment = spectrum[start:stop]
+            if segment.size < 3:
+                continue
+            padded = np.pad(segment, (1, 1), mode="edge")
+            result[start:stop] = np.convolve(padded, weights, mode="valid")
+        return result
+
+    @staticmethod
+    def cris_sinc_resample(
+        source_wavenumber_cm: np.ndarray,
+        source_values: np.ndarray,
+        target_wavenumber_cm: np.ndarray,
+        channel_spacing_cm: float = 0.625,
+        half_width_lobes: int = 8,
+    ) -> np.ndarray:
+        """用CrIS理想sinc仪器线型把过采样仿真卷积到FSR通道。"""
+        source_x = np.asarray(source_wavenumber_cm, dtype=float).reshape(-1)
+        source_y = np.asarray(source_values, dtype=float).reshape(-1)
+        target_x = np.asarray(target_wavenumber_cm, dtype=float).reshape(-1)
+        valid = np.isfinite(source_x) & np.isfinite(source_y)
+        source_x, source_y = source_x[valid], source_y[valid]
+        order = np.argsort(source_x)
+        source_x, source_y = source_x[order], source_y[order]
+        source_x, unique_indices = np.unique(source_x, return_index=True)
+        source_y = source_y[unique_indices]
+        if source_x.size < 3:
+            raise ValueError("CrIS sinc卷积至少需要三个有效仿真波数点。")
+        spacing = float(channel_spacing_cm)
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            raise ValueError("CrIS通道间隔必须为有限正值。")
+        half_width = max(int(half_width_lobes), 1) * spacing
+        output = np.full(target_x.shape, np.nan, dtype=float)
+        for index, target in enumerate(target_x):
+            left = int(np.searchsorted(source_x, target - half_width, side="left"))
+            right = int(np.searchsorted(source_x, target + half_width, side="right"))
+            local_x = source_x[left:right]
+            local_y = source_y[left:right]
+            if local_x.size < 3:
+                continue
+            response = np.sinc((local_x - target) / spacing)
+            normalization = float(np.trapezoid(response, local_x))
+            if abs(normalization) <= np.finfo(float).eps:
+                continue
+            output[index] = float(
+                np.trapezoid(response * local_y, local_x) / normalization
+            )
+        return output
 
     @staticmethod
     def build_per_wavenumber_corrections(
@@ -97,6 +170,18 @@ class SpectrumValidationManager:
             return self._read_hdf5(path)
         return self._read_table(path)
 
+    @staticmethod
+    def read_sidecar_metadata(file_path: str | Path) -> dict[str, Any]:
+        """读取与光谱同名的JSON元数据；没有侧车文件时返回空字典。"""
+        path = Path(file_path)
+        metadata_path = path.with_suffix(".json")
+        if not metadata_path.exists():
+            return {}
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"光谱元数据必须是JSON对象：{metadata_path}")
+        return payload
+
     def suggest_series(self, series: dict[str, np.ndarray]) -> tuple[str, str]:
         names = list(series)
         if len(names) < 2:
@@ -149,18 +234,37 @@ class SpectrumValidationManager:
             raise ValueError("坐标转换后没有足够的唯一正波长点。")
         return {
             "wavelength_um": wavelength_um,
+            "wavenumber_cm": 1.0e4 / wavelength_um,
             "values": values,
             "axis_name": axis_name,
             "value_name": value_name,
             "axis_kind": resolved_kind,
         }
 
-    def from_atmospheric_detector_result(self, spectrum: dict[str, Any]) -> dict[str, Any]:
+    def from_atmospheric_detector_result(
+        self,
+        spectrum: dict[str, Any],
+        effective_cloud_fraction: float | None = None,
+    ) -> dict[str, Any]:
         if not spectrum:
             raise ValueError("当前没有探测器接收的大气辐射传输光谱结果。")
         try:
             wavelength = np.asarray(spectrum["wavelength_um"], dtype=float)
-            values = np.asarray(spectrum["earth_total_spectral_irradiance"], dtype=float)
+            if effective_cloud_fraction is None:
+                values = np.asarray(
+                    spectrum["earth_total_spectral_irradiance"], dtype=float
+                )
+            else:
+                fraction = float(effective_cloud_fraction)
+                if not np.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+                    raise ValueError("有效云量必须位于0～1之间。")
+                clear = np.asarray(
+                    spectrum["cloud_clear_total_spectral_irradiance"], dtype=float
+                )
+                overcast = np.asarray(
+                    spectrum["cloud_overcast_total_spectral_irradiance"], dtype=float
+                )
+                values = clear + fraction * (overcast - clear)
         except KeyError as exc:
             raise ValueError("当前大气仿真结果缺少探测器接收的总大气传输波长谱。") from exc
         result = self.build_spectrum(
@@ -174,7 +278,166 @@ class SpectrumValidationManager:
         result["value_unit"] = (
             "W·m⁻²·sr⁻¹·μm⁻¹" if quantity == "radiance" else "W·m⁻²·μm⁻¹"
         )
+        result["spectral_processing"] = str(
+            spectrum.get("spectral_processing", "monochromatic_simulation")
+        )
         return result
+
+    def fit_effective_cloud_fraction(
+        self,
+        atmospheric_result: dict[str, Any],
+        observed: dict[str, Any],
+    ) -> dict[str, Any]:
+        """用大气窗口内的晴空/全云端元拟合同足迹有效云量。
+
+        只采用对低层云敏感、受强气体吸收影响较小的8.0–9.2和
+        10.2–12.5 μm窗口。存在同足迹NUCAPS云量时将其作为弱先验，
+        而不是直接固定采用，避免用云量补偿O3、CO2或水汽带误差。
+        """
+        try:
+            wavelength = np.asarray(
+                atmospheric_result["wavelength_um"], dtype=float
+            ).reshape(-1)
+            clear = np.asarray(
+                atmospheric_result["cloud_clear_total_spectral_irradiance"],
+                dtype=float,
+            ).reshape(-1)
+            overcast = np.asarray(
+                atmospheric_result["cloud_overcast_total_spectral_irradiance"],
+                dtype=float,
+            ).reshape(-1)
+            observed_wavelength = np.asarray(
+                observed["wavelength_um"], dtype=float
+            ).reshape(-1)
+            observed_values = np.asarray(observed["values"], dtype=float).reshape(-1)
+        except KeyError as exc:
+            raise ValueError("仿真结果缺少晴空/全云云量拟合端元。") from exc
+        if not (
+            wavelength.size == clear.size == overcast.size
+            and observed_wavelength.size == observed_values.size
+        ):
+            raise ValueError("云量拟合端元或卫星光谱的数组长度不一致。")
+        valid_model = (
+            np.isfinite(wavelength)
+            & np.isfinite(clear)
+            & np.isfinite(overcast)
+            & (wavelength > 0.0)
+        )
+        if np.count_nonzero(valid_model) < 3:
+            raise ValueError("晴空/全云端元没有足够的有效光谱点。")
+        wavelength = wavelength[valid_model]
+        clear = clear[valid_model]
+        overcast = overcast[valid_model]
+        order = np.argsort(wavelength)
+        wavelength, clear, overcast = (
+            wavelength[order], clear[order], overcast[order]
+        )
+        lower = max(float(wavelength[0]), float(np.nanmin(observed_wavelength)))
+        upper = min(float(wavelength[-1]), float(np.nanmax(observed_wavelength)))
+        selected = (
+            np.isfinite(observed_wavelength)
+            & np.isfinite(observed_values)
+            & (observed_values >= 0.0)
+            & (observed_wavelength >= lower)
+            & (observed_wavelength <= upper)
+        )
+        fit_wavelength = observed_wavelength[selected]
+        measured = observed_values[selected]
+        if fit_wavelength.size < 3:
+            raise ValueError("卫星谱与云量端元没有足够的共同通道。")
+        fit_wavenumber = 1.0e4 / fit_wavelength
+        clear_common = self.three_point_hamming(
+            np.interp(fit_wavelength, wavelength, clear), fit_wavenumber
+        )
+        overcast_common = self.three_point_hamming(
+            np.interp(fit_wavelength, wavelength, overcast), fit_wavenumber
+        )
+        measured = self.three_point_hamming(measured, fit_wavenumber)
+        sensitivity = overcast_common - clear_common
+        window_mask = np.zeros(fit_wavelength.shape, dtype=bool)
+        for window_lower, window_upper in CLOUD_FIT_WINDOWS_UM:
+            inside_window = (
+                (fit_wavelength >= window_lower)
+                & (fit_wavelength <= window_upper)
+            )
+            # 三点Hamming会使用左右相邻通道。仅保留三个通道都位于同一
+            # 大气窗口内的中心点，防止窗口外强吸收带残差从边界泄漏。
+            interior = (
+                inside_window
+                & np.concatenate(([False], inside_window[:-1]))
+                & np.concatenate((inside_window[1:], [False]))
+            )
+            window_mask |= interior
+        finite = (
+            np.isfinite(clear_common)
+            & np.isfinite(overcast_common)
+            & np.isfinite(measured)
+            & np.isfinite(sensitivity)
+            & window_mask
+        )
+        nonzero = np.abs(sensitivity[finite])
+        if nonzero.size < 3 or float(np.max(nonzero)) <= np.finfo(float).eps:
+            raise ValueError("晴空与全云端元差异过小，无法拟合有效云量。")
+        threshold = max(float(np.percentile(nonzero, 20.0)), np.finfo(float).eps)
+        fit_mask = finite & (np.abs(sensitivity) >= threshold)
+        delta = sensitivity[fit_mask]
+        target = measured[fit_mask] - clear_common[fit_mask]
+        denominator = float(np.dot(delta, delta))
+        if denominator <= np.finfo(float).eps:
+            raise ValueError("有效云量拟合矩阵退化。")
+        numerator = float(np.dot(delta, target))
+        unconstrained = float(numerator / denominator)
+        nucaps_cloud = atmospheric_result.get("nucaps_same_footprint_cloud")
+        prior_fraction: float | None = None
+        if isinstance(nucaps_cloud, dict):
+            candidate = nucaps_cloud.get("fraction")
+            if candidate is not None:
+                candidate = float(candidate)
+                if np.isfinite(candidate) and 0.0 <= candidate <= 1.0:
+                    prior_fraction = candidate
+        prior_relative_weight = (
+            NUCAPS_CLOUD_PRIOR_RELATIVE_WEIGHT
+            if prior_fraction is not None else 0.0
+        )
+        if prior_fraction is not None:
+            regularization = prior_relative_weight * denominator
+            regularized = float(
+                (numerator + regularization * prior_fraction)
+                / (denominator + regularization)
+            )
+        else:
+            regularized = unconstrained
+        fraction = float(np.clip(regularized, 0.0, 1.0))
+        fitted_common = clear_common + fraction * sensitivity
+        grid_fraction = float(
+            atmospheric_result.get("representative_cloud_fraction", 0.0)
+        )
+        grid_common = clear_common + np.clip(grid_fraction, 0.0, 1.0) * sensitivity
+        fitted_rmse = float(np.sqrt(np.mean(np.square(fitted_common[finite] - measured[finite]))))
+        grid_rmse = float(np.sqrt(np.mean(np.square(grid_common[finite] - measured[finite]))))
+        simulated_spectrum = self.from_atmospheric_detector_result(
+            atmospheric_result, fraction
+        )
+        return {
+            "effective_cloud_fraction": fraction,
+            "unconstrained_cloud_fraction": unconstrained,
+            "regularized_cloud_fraction": regularized,
+            "prior_cloud_fraction": prior_fraction,
+            "prior_relative_weight": prior_relative_weight,
+            "fit_channel_count": int(np.count_nonzero(fit_mask)),
+            "fit_windows_um": [list(window) for window in CLOUD_FIT_WINDOWS_UM],
+            "overlap_min_um": lower,
+            "overlap_max_um": upper,
+            "rmse_fitted": fitted_rmse,
+            "rmse_environment_grid_fraction": grid_rmse,
+            "environment_grid_fraction": grid_fraction,
+            "source": (
+                "卫星同足迹大气窗口拟合（NUCAPS弱先验）"
+                if prior_fraction is not None
+                else "卫星同足迹大气窗口晴空/全云端元拟合"
+            ),
+            "simulated_spectrum": simulated_spectrum,
+        }
 
     def compare(
         self,
@@ -193,10 +456,49 @@ class SpectrumValidationManager:
         observed_y = obs_y[mask]
         if common_x.size < 2:
             raise ValueError("仿真光谱与卫星产品没有足够的重叠波段。")
+        instrument = str(observed.get("instrument", "")).strip().lower()
+        common_wavenumber = np.divide(
+            1.0e4,
+            common_x,
+            out=np.full(common_x.shape, np.nan, dtype=float),
+            where=common_x > 0.0,
+        )
+        spectral_processing = "linear_interpolation + three_point_hamming"
+        source_simulated_y = sim_y
         simulated_y = np.interp(common_x, sim_x, sim_y)
-        # 两侧采用完全相同的三点切趾，避免把处理链差异误认为光学厚度误差。
-        simulated_y = self.three_point_hamming(simulated_y)
-        observed_y = self.three_point_hamming(observed_y)
+        if "cris" in instrument and sim_x.size >= 3 and common_x.size >= 3:
+            sim_wavenumber = 1.0e4 / sim_x
+            sim_spacing = np.abs(np.diff(np.sort(sim_wavenumber)))
+            obs_spacing = np.abs(np.diff(np.sort(common_wavenumber)))
+            sim_spacing = sim_spacing[np.isfinite(sim_spacing) & (sim_spacing > 0.0)]
+            obs_spacing = obs_spacing[np.isfinite(obs_spacing) & (obs_spacing > 0.0)]
+            if sim_spacing.size and obs_spacing.size:
+                obs_nominal = float(np.percentile(obs_spacing, 25.0))
+                sim_nominal = float(np.percentile(sim_spacing, 50.0))
+                # 只有真正过采样的仿真才执行sinc积分；与CrIS同采样率的
+                # 数据无法恢复未保存的高分辨率信息，避免伪卷积。
+                if sim_nominal <= 0.5 * obs_nominal:
+                    convolved = self.cris_sinc_resample(
+                        sim_wavenumber,
+                        source_simulated_y,
+                        common_wavenumber,
+                        channel_spacing_cm=obs_nominal,
+                    )
+                    finite_convolution = np.isfinite(convolved)
+                    simulated_y[finite_convolution] = convolved[finite_convolution]
+                    spectral_processing = (
+                        f"CrIS sinc ILS ({obs_nominal:.6g} cm^-1) + "
+                        "[0.23,0.54,0.23] Hamming"
+                    )
+                else:
+                    spectral_processing = (
+                        "CrIS同通道采样（未做sinc：仿真网格未过采样） + "
+                        "[0.23,0.54,0.23] Hamming"
+                    )
+        # 两侧采用完全相同的官方三点切趾，且不跨CrIS谱段间隙卷积。
+        hamming_coordinate = common_wavenumber if "cris" in instrument else None
+        simulated_y = self.three_point_hamming(simulated_y, hamming_coordinate)
+        observed_y = self.three_point_hamming(observed_y, hamming_coordinate)
         scale_factor = self._scale_factor(simulated_y, observed_y, scaling, common_x)
         simulated_scaled = simulated_y * scale_factor
         residual = simulated_scaled - observed_y
@@ -230,6 +532,7 @@ class SpectrumValidationManager:
                 "spectral_angle_deg": spectral_angle_deg,
             },
             "scaling": scaling,
+            "spectral_processing": spectral_processing,
         }
 
     def export_csv(self, result: dict[str, Any], file_path: str | Path) -> Path:

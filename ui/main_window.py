@@ -124,6 +124,11 @@ class AtmosphereMainWindow(QMainWindow):
         self.latest_spectrum: dict[str, Any] | None = None
         self.latest_sample: dict[str, Any] | None = None
         self.latest_parameters: dict[str, Any] | None = None
+        self.effective_cloud_fraction: float | None = None
+        self.cloud_fraction_source = ""
+        self.effective_cloud_location: tuple[float, float] | None = None
+        self.nucaps_cloud_file = ""
+        self.nucaps_cloud_for_index = 0
         self.corrections: list[dict[str, float]] = []
         saved_workspace = self._read_recent_workspace()
         self.workspace = (
@@ -280,12 +285,36 @@ class AtmosphereMainWindow(QMainWindow):
         self.latitude = double_spin(0.0, -90.0, 90.0, 5, "°")
         self.longitude = double_spin(0.0, -180.0, 180.0, 5, "°")
         self.altitude = double_spin(700.0, 0.001, 1.0e6, 3, " km")
-        self.solar_ra = double_spin(0.0, -360.0, 360.0, 4, "°")
-        self.solar_dec = double_spin(0.0, -90.0, 90.0, 4, "°")
+        self.solar_zenith = double_spin(0.0, 0.0, 180.0, 4, "°")
+        self.solar_zenith.setToolTip(
+            "目标位置的局地太阳天顶角：0°为太阳位于天顶，90°为地平线，"
+            "大于90°为夜间。"
+        )
+        self.solar_azimuth = double_spin(180.0, 0.0, 360.0, 4, "°")
+        self.solar_azimuth.setToolTip(
+            "目标位置的局地太阳方位角：从正北起顺时针计量，"
+            "北=0°、东=90°、南=180°、西=270°。"
+        )
+        self.satellite_zenith = double_spin(0.0, 0.0, 89.999, 4, "°")
+        self.satellite_zenith.setToolTip(
+            "足迹处卫星观测方向与局地天顶的夹角。0°为垂直观测；"
+            "高分辨率单柱模式按 tau/cos(卫星天顶角) 计算斜程。"
+        )
+        self.satellite_azimuth = double_spin(0.0, 0.0, 360.0, 4, "°")
+        self.satellite_azimuth.setToolTip(
+            "足迹指向卫星的局地方位角，从正北起顺时针计量；"
+            "用于计算太阳—观测散射夹角。"
+        )
         self.visibility = double_spin(23.0, 1.0, 200.0, 1, " km")
         self.temperature_offset = double_spin(0.0, -15.0, 15.0, 1, " K")
         self.enable_cloud = QCheckBox("启用液态水云模型")
         self.enable_cloud.setChecked(True)
+        self.enable_cloud.setToolTip(
+            "高分辨率验证读取同足迹NUCAPS云量作为弱先验，并由"
+            "CrIS/卫星观测谱的大气窗口晴空—全云端元拟合最终有效云量；"
+            "不直接固定采用NUCAPS或全球云图网格值。"
+        )
+        self.enable_cloud.toggled.connect(self._on_cloud_model_toggled)
         self.enable_scattering = QCheckBox("启用大气散射")
         self.enable_scattering.setChecked(True)
         toggles = QHBoxLayout()
@@ -302,8 +331,10 @@ class AtmosphereMainWindow(QMainWindow):
         form.addRow("纬度", self.latitude)
         form.addRow("经度", self.longitude)
         form.addRow("观测高度", self.altitude)
-        form.addRow("太阳赤经", self.solar_ra)
-        form.addRow("太阳赤纬", self.solar_dec)
+        form.addRow("太阳天顶角", self.solar_zenith)
+        form.addRow("太阳方位角", self.solar_azimuth)
+        form.addRow("卫星天顶角", self.satellite_zenith)
+        form.addRow("卫星方位角", self.satellite_azimuth)
         form.addRow("能见度", self.visibility)
         form.addRow("10 km以上温度偏移", self.temperature_offset)
         form.addRow("物理过程", toggles)
@@ -350,6 +381,8 @@ class AtmosphereMainWindow(QMainWindow):
             page,
             correction_handler=self._configure_corrections,
             automatic_correction_handler=self._automatically_correct_optical_depth,
+            cloud_fit_handler=self._apply_effective_cloud_fit,
+            observation_geometry_handler=self._apply_validation_geometry,
             embedded=True,
         )
         layout.addWidget(self.validation_workbench)
@@ -505,17 +538,48 @@ class AtmosphereMainWindow(QMainWindow):
             self.latitude.setValue(float(atmosphere.get("specified_latitude_deg", 0.0)))
             self.longitude.setValue(float(atmosphere.get("specified_longitude_deg", 0.0)))
             self.altitude.setValue(float(atmosphere.get("specified_altitude", 700.0)))
-            self.solar_ra.setValue(
-                float(atmosphere.get("specified_solar_right_ascension_deg", 0.0))
-            )
-            self.solar_dec.setValue(
-                float(atmosphere.get("specified_solar_declination_deg", 0.0))
-            )
+            if "specified_solar_zenith_deg" in atmosphere:
+                solar_zenith = float(atmosphere["specified_solar_zenith_deg"])
+                solar_azimuth = float(
+                    atmosphere.get("specified_solar_azimuth_deg", 180.0)
+                )
+            else:
+                migrated_solar = build_specified_location_sample(atmosphere)
+                solar_zenith = migrated_solar["solar_zenith"]
+                solar_azimuth = migrated_solar["solar_azimuth"]
+            self.solar_zenith.setValue(solar_zenith)
+            self.solar_azimuth.setValue(solar_azimuth)
+            self.satellite_zenith.setValue(float(
+                atmosphere.get("specified_satellite_zenith_deg", 0.0)
+            ))
+            self.satellite_azimuth.setValue(float(
+                atmosphere.get("specified_satellite_azimuth_deg", 0.0)
+            ))
             self.visibility.setValue(float(atmosphere.get("visibility_km", 23.0)))
             self.temperature_offset.setValue(
                 float(atmosphere.get("upper_atmosphere_temperature_offset_k", 0.0))
             )
             self.enable_cloud.setChecked(bool(atmosphere.get("enable_cloud", True)))
+            fitted_cloud = atmosphere.get("effective_cloud_fraction")
+            self.effective_cloud_fraction = (
+                None if fitted_cloud in (None, "") else float(fitted_cloud)
+            )
+            self.cloud_fraction_source = str(
+                atmosphere.get("cloud_fraction_source", "")
+            )
+            fitted_location = atmosphere.get("effective_cloud_location")
+            self.effective_cloud_location = (
+                (float(fitted_location[0]), float(fitted_location[1]))
+                if isinstance(fitted_location, (list, tuple))
+                and len(fitted_location) == 2
+                else None
+            )
+            self.nucaps_cloud_file = str(
+                atmosphere.get("nucaps_cloud_file", "")
+            )
+            self.nucaps_cloud_for_index = int(
+                atmosphere.get("nucaps_cloud_for_index", 0)
+            )
             self.enable_scattering.setChecked(
                 bool(atmosphere.get("enable_scattering", True))
             )
@@ -547,7 +611,27 @@ class AtmosphereMainWindow(QMainWindow):
                 restored.append("大气状态模式模型")
             cache_path = self._resolve_project_path(self.environment_cache.text())
             if cache_path is not None and cache_path.exists():
-                grid = self.modis.load_cache(cache_path)
+                try:
+                    grid = self.modis.load_cache(cache_path)
+                except ValueError as exc:
+                    if "旧版MODIS温度处理" not in str(exc):
+                        raise
+                    source_paths = [
+                        self._resolve_project_path(self.land_temperature.text()),
+                        self._resolve_project_path(self.sea_temperature.text()),
+                        self._resolve_project_path(self.cloud_product.text()),
+                        self._resolve_project_path(self.land_type.text()),
+                    ]
+                    if not all(path is not None and path.exists() for path in source_paths):
+                        raise ValueError(
+                            "环境缓存已过期，且原始陆温、海温、云或地表类型产品不完整。"
+                        ) from exc
+                    grid = self.modis.load_products(
+                        *(str(path) for path in source_paths if path is not None),
+                        self.resolution.value(),
+                    )
+                    self.modis.save_cache(cache_path)
+                    self._log(f"旧环境缓存已按新温度处理流程自动重建：{cache_path}")
                 self.environment_cache.setText(str(cache_path))
                 restored.append(
                     f"环境缓存 {grid.latitude.shape[0]}×{grid.latitude.shape[1]}"
@@ -766,6 +850,7 @@ class AtmosphereMainWindow(QMainWindow):
         try:
             self.radiation.atmosphere.load_absorption_optical_depth(path)
             self.corrections = []
+            self._clear_effective_cloud_fit()
             self._log(f"35层总光学厚度已加载：{path}")
             self._save_project(silent=True)
         except Exception as exc:  # noqa: BLE001
@@ -798,15 +883,18 @@ class AtmosphereMainWindow(QMainWindow):
             return False
 
     def _scenario_parameters(self) -> dict[str, Any]:
-        return {
+        parameters = {
             "specified_time_s": self.time_s.value(),
             "specified_latitude_deg": self.latitude.value(),
             "specified_longitude_deg": self.longitude.value(),
             "specified_altitude": self.altitude.value(),
-            "specified_solar_right_ascension_deg": self.solar_ra.value(),
-            "specified_solar_declination_deg": self.solar_dec.value(),
+            "specified_solar_zenith_deg": self.solar_zenith.value(),
+            "specified_solar_azimuth_deg": self.solar_azimuth.value(),
+            "specified_satellite_zenith_deg": self.satellite_zenith.value(),
+            "specified_satellite_azimuth_deg": self.satellite_azimuth.value(),
             "visibility_km": self.visibility.value(),
             "enable_cloud": self.enable_cloud.isChecked(),
+            "cloud_fraction_policy": "same_footprint_or_spectral_fit_v1",
             "enable_scattering": self.enable_scattering.isChecked(),
             "altitude_unit": "km",
             "mode": "fast",
@@ -818,6 +906,193 @@ class AtmosphereMainWindow(QMainWindow):
             "merra2_aerosol_file": self.merra_product.text(),
             "merra2_time_offset_hours": 0.0,
         }
+        if self.nucaps_cloud_file:
+            parameters["nucaps_cloud_file"] = self.nucaps_cloud_file
+            parameters["nucaps_cloud_for_index"] = self.nucaps_cloud_for_index
+        current_location = (self.latitude.value(), self.longitude.value())
+        if (
+            self.effective_cloud_fraction is not None
+            and self.effective_cloud_location is not None
+            and np.allclose(
+                current_location, self.effective_cloud_location, rtol=0.0, atol=1.0e-8
+            )
+        ):
+            parameters["effective_cloud_fraction"] = self.effective_cloud_fraction
+            parameters["cloud_fraction_source"] = self.cloud_fraction_source
+            parameters["effective_cloud_location"] = list(
+                self.effective_cloud_location
+            )
+        return parameters
+
+    def _clear_effective_cloud_fit(self) -> None:
+        self.effective_cloud_fraction = None
+        self.cloud_fraction_source = ""
+        self.effective_cloud_location = None
+
+    def _on_cloud_model_toggled(self, enabled: bool) -> None:
+        """物理过程开关变化后废弃按旧云设置生成的光谱。"""
+        self._clear_effective_cloud_fit()
+        if not self.latest_spectrum:
+            return
+        previous = bool(self.latest_spectrum.get("cloud_model_enabled", False))
+        if previous == bool(enabled):
+            return
+        self.latest_spectrum = None
+        self.latest_sample = None
+        self.latest_parameters = None
+        if hasattr(self, "validation_workbench"):
+            self.validation_workbench.set_atmospheric_result(None)
+        if hasattr(self, "result_summary"):
+            self.result_summary.setText("云模型开关已变化，请重新执行大气辐射传输求解。")
+
+    def _apply_effective_cloud_fit(
+        self, diagnostics: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """保存 CrIS/卫星光谱拟合的视场有效云量并更新当前总谱。"""
+        if not self.latest_spectrum or self.latest_sample is None:
+            return None
+        fraction = float(diagnostics["effective_cloud_fraction"])
+        if not np.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+            raise ValueError("光谱拟合返回了无效云量。")
+        self.effective_cloud_fraction = fraction
+        self.cloud_fraction_source = str(
+            diagnostics.get("source", "卫星同足迹光谱晴空/全云端元拟合")
+        )
+        self.effective_cloud_location = (
+            float(self.latest_sample["lat"]),
+            float(self.latest_sample["lon"]),
+        )
+        updated = dict(self.latest_spectrum)
+        clear_wavelength = np.asarray(
+            updated["cloud_clear_total_spectral_irradiance"], dtype=float
+        )
+        cloudy_wavelength = np.asarray(
+            updated["cloud_overcast_total_spectral_irradiance"], dtype=float
+        )
+        clear_wavenumber = np.asarray(
+            updated["cloud_clear_total_spectral_wavenumber"], dtype=float
+        )
+        cloudy_wavenumber = np.asarray(
+            updated["cloud_overcast_total_spectral_wavenumber"], dtype=float
+        )
+        total_wavelength = clear_wavelength + fraction * (
+            cloudy_wavelength - clear_wavelength
+        )
+        total_wavenumber = clear_wavenumber + fraction * (
+            cloudy_wavenumber - clear_wavenumber
+        )
+        updated["earth_total_spectral_irradiance"] = total_wavelength
+        updated["earth_total_spectral_wavenumber"] = total_wavenumber
+        updated["earth_total_irradiance"] = float(np.trapezoid(
+            total_wavenumber, np.asarray(updated["wavenumber_cm"], dtype=float)
+        ))
+        updated["representative_cloud_fraction"] = fraction
+        updated["effective_cloud_fraction"] = fraction
+        updated["cloud_fraction_source"] = self.cloud_fraction_source
+        updated["cloud_fraction_fit_pending"] = False
+        updated["effective_cloud_fit"] = {
+            key: value
+            for key, value in diagnostics.items()
+            if key != "simulated_spectrum"
+        }
+        updated["cloud_component_breakdown_is_provisional"] = True
+        self.latest_spectrum = updated
+        parameters = dict(self.latest_parameters or self._scenario_parameters())
+        parameters.update({
+            "enable_cloud": True,
+            "effective_cloud_fraction": fraction,
+            "cloud_fraction_source": self.cloud_fraction_source,
+            "effective_cloud_location": list(self.effective_cloud_location),
+        })
+        self.latest_parameters = parameters
+        self.validation_workbench.set_atmospheric_result(updated)
+        self._update_spectrum_summary(updated)
+        prior_fraction = diagnostics.get("prior_cloud_fraction")
+        prior_text = (
+            f"{float(prior_fraction):.2%}"
+            if prior_fraction is not None else "无"
+        )
+        self._log(
+            "已使用卫星同足迹大气窗口拟合有效云量："
+            f"{fraction:.2%}（NUCAPS先验={prior_text}，"
+            "先验仅作弱约束）。"
+        )
+        self._save_project(silent=True)
+        return dict(updated)
+
+    def _apply_validation_geometry(self, metadata: dict[str, Any]) -> bool:
+        """将卫星光谱侧车中的同足迹观测几何写入单柱求解参数。
+
+        返回值表示当前仿真结果是否需要按新几何重新计算。验证工作台据此
+        暂停绝对值比较，避免把旧的垂直路径结果与斜视卫星谱直接比较。
+        """
+        mapping = (
+            ("latitude_deg", self.latitude),
+            ("longitude_deg", self.longitude),
+            ("satellite_height_km", self.altitude),
+            ("solar_zenith_deg", self.solar_zenith),
+            ("solar_azimuth_deg", self.solar_azimuth),
+            ("satellite_zenith_deg", self.satellite_zenith),
+            ("satellite_azimuth_deg", self.satellite_azimuth),
+        )
+        applied: dict[str, float] = {}
+        for name, widget in mapping:
+            if name not in metadata:
+                continue
+            value = float(metadata[name])
+            if not np.isfinite(value):
+                continue
+            widget.setValue(value)
+            applied[name] = value
+        if not applied:
+            return False
+
+        high_resolution_index = self.spectral_mode.findData("high_resolution")
+        if high_resolution_index >= 0:
+            self.spectral_mode.setCurrentIndex(high_resolution_index)
+
+        result_names = {
+            "latitude_deg": "target_latitude_deg",
+            "longitude_deg": "target_longitude_deg",
+            "satellite_height_km": "target_altitude_m",
+            "solar_zenith_deg": "solar_zenith_deg",
+            "solar_azimuth_deg": "solar_azimuth_deg",
+            "satellite_zenith_deg": "satellite_zenith_deg",
+            "satellite_azimuth_deg": "satellite_azimuth_deg",
+        }
+        recalculation_required = not bool(self.latest_spectrum)
+        if self.latest_spectrum:
+            for metadata_name, requested in applied.items():
+                current = self.latest_spectrum.get(result_names[metadata_name])
+                if current is None:
+                    recalculation_required = True
+                    break
+                requested_value = (
+                    requested * 1000.0
+                    if metadata_name == "satellite_height_km"
+                    else requested
+                )
+                if not np.isclose(
+                    float(current), requested_value, rtol=0.0, atol=1.0e-3
+                ):
+                    recalculation_required = True
+                    break
+        if recalculation_required:
+            self._clear_effective_cloud_fit()
+            self.latest_spectrum = None
+            self.latest_sample = None
+            self.latest_parameters = None
+            self.validation_workbench.set_atmospheric_result(None)
+            self.result_summary.setText(
+                "卫星观测几何已更新，请重新执行高分辨率单柱求解。"
+            )
+        self._log(
+            "已从卫星光谱元数据读取同足迹观测几何："
+            f"卫星天顶角 {self.satellite_zenith.value():.3f}°，"
+            f"卫星方位角 {self.satellite_azimuth.value():.3f}°。"
+        )
+        self._save_project(silent=True)
+        return recalculation_required
 
     def _compute_spectrum(self) -> None:
         grid = self.modis.get_grid()
@@ -916,6 +1191,15 @@ class AtmosphereMainWindow(QMainWindow):
             if profile_path:
                 self.pattern_workbench.set_query_profile(profile_path)
             self.corrections = []
+            self._clear_effective_cloud_fit()
+            manifest_path = Path(str(result.get("manifest_file", "")))
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                profile = manifest.get("profile", {})
+                source = Path(str(profile.get("source_file", ""))).expanduser()
+                if source.suffix.lower() in {".nc", ".nc4"} and source.is_file():
+                    self.nucaps_cloud_file = str(source.resolve())
+                    self.nucaps_cloud_for_index = int(profile.get("for_index", 0))
             self._log(f"HAPI 35层总光学厚度生成并加载：{path}")
             self._save_project(silent=True)
         except Exception as exc:  # noqa: BLE001
@@ -928,6 +1212,9 @@ class AtmosphereMainWindow(QMainWindow):
             self.radiation.atmosphere.load_absorption_optical_depth(path)
             self.absorption_file.setText(path)
             self.corrections = []
+            self._clear_effective_cloud_fit()
+            self.nucaps_cloud_file = ""
+            self.nucaps_cloud_for_index = 0
             confidence = float(prediction.get("confidence", 0.0))
             self._log(
                 f"大气状态模式插值光学厚度已加载：{path}；置信度={confidence:.1%}"
@@ -971,7 +1258,7 @@ class AtmosphereMainWindow(QMainWindow):
     def _automatically_correct_optical_depth(
         self, comparison: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Fit upper-atmosphere temperature and per-channel optical-depth factors."""
+        """在已拟合有效云量下修正高层温度和逐通道光学厚度。"""
         parent = QApplication.activeModalWidget() or self
         atmosphere = self.radiation.atmosphere
         grid = self.modis.get_grid()
@@ -1027,8 +1314,8 @@ class AtmosphereMainWindow(QMainWindow):
         temperature_candidates = np.arange(-15.0, 15.0 + 0.5, 1.0)
         factor_candidates = np.unique(np.r_[np.geomspace(0.2, 5.0, 17), 1.0])
         total = int(temperature_candidates.size + factor_candidates.size + 1)
-        progress = QProgressDialog("正在自动矫正总光学厚度…", "取消", 0, total, parent)
-        progress.setWindowTitle("一键自动矫正总光学厚度")
+        progress = QProgressDialog("正在按拟合云量自动矫正总光学厚度…", "取消", 0, total, parent)
+        progress.setWindowTitle("拟合云量并矫正总光学厚度")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
@@ -1060,7 +1347,9 @@ class AtmosphereMainWindow(QMainWindow):
                 np.asarray(spectrum["wavelength_um"], dtype=float),
                 np.asarray(spectrum["earth_total_spectral_irradiance"], dtype=float),
             )
-            return spectrum, validator.three_point_hamming(raw)
+            return spectrum, validator.three_point_hamming(
+                raw, 1.0e4 / np.asarray(wavelength, dtype=float)
+            )
 
         try:
             baseline_rmse = float(np.sqrt(np.mean(np.square(simulated - observed))))

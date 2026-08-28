@@ -223,6 +223,13 @@ class ModisPreviewDialog(QDialog):
             f"云顶高度(km)：min={cloud_height[0]:.2f}，mean={cloud_height[1]:.2f}，max={cloud_height[2]:.2f}",
             f"液态水路径LWP(g/m²)：min={cloud_lwp[0]:.2f}，mean={cloud_lwp[1]:.2f}，max={cloud_lwp[2]:.2f}，来源={cloud_lwp_source}",
         ]
+        if "land_temperature_observed_fraction" in grid.metadata:
+            lines.append(
+                "地表温度晴空观测覆盖："
+                f"陆地={100.0 * float(grid.metadata['land_temperature_observed_fraction']):.2f}%、"
+                f"海洋={100.0 * float(grid.metadata['sea_temperature_observed_fraction']):.2f}%；"
+                "云遮挡缺测已在同类下垫面内空间填补"
+            )
         if aerosol_field is not None and aerosol_time_index is not None:
             aod = cls._finite_stats(aerosol_field.aerosol_optical_depth_550[aerosol_time_index])
             lines.append(f"MERRA-2匹配时刻={aerosol_field.time_labels[aerosol_time_index]}")

@@ -1,0 +1,64 @@
+{
+  "source_radiance_file": "SCRIF_j01_d20250203_t0040589_e0041287_b37365_c20250203012427168000_oeac_ops.h5",
+  "source_geolocation_file": "GCRSO_j01_d20250203_t0040589_e0041287_b37365_c20250203012427546000_oeac_ops.h5",
+  "product": "NOAA-20 CrIS-FS-SDR",
+  "platform": "JPSS-1 / NOAA-20",
+  "instrument": "CrIS",
+  "indices": {
+    "scan": 0,
+    "xtrack": 4,
+    "fov": 4
+  },
+  "for_number": 5,
+  "fov_number": 5,
+  "target_latitude_deg": -45.3448448,
+  "target_longitude_deg": -168.3952484,
+  "target_distance_km": 0.0,
+  "observation_time_utc": "2025-02-03T00:40:59.783968Z",
+  "latitude_deg": -45.344844818115234,
+  "longitude_deg": -168.39524841308594,
+  "surface_height_m": -8.0,
+  "satellite_height_km": 843.6500683781561,
+  "satellite_range_km": 1064.446625,
+  "satellite_zenith_deg": 40.39033508300781,
+  "satellite_azimuth_deg": 83.46218872070312,
+  "solar_zenith_deg": 32.7082405090332,
+  "solar_azimuth_deg": 325.91064453125,
+  "solar_right_ascension_deg": 316.896685845011,
+  "solar_declination_deg": -16.50159561327031,
+  "julian_day": 2460709.528469722,
+  "spacecraft_position_ecef_m": [
+    -4885051.0,
+    -1700037.5,
+    -5024954.5
+  ],
+  "quality_flags": {
+    "QF1_SCAN_CRISSDR": 0,
+    "QF2_CRISSDR": [
+      0,
+      0,
+      0
+    ],
+    "QF3_CRISSDR": [
+      0,
+      0,
+      0
+    ],
+    "QF4_CRISSDR": [
+      0,
+      0,
+      0
+    ],
+    "QF1_CRISSDRGEO": 0
+  },
+  "channel_counts": {
+    "LW": 717,
+    "MW": 869,
+    "SW": 637
+  },
+  "spectral_point_count": 2223,
+  "wavenumber_min_cm-1": 648.75,
+  "wavenumber_max_cm-1": 2551.25,
+  "radiance_unit": "W m-2 sr-1 um-1",
+  "source_radiance_unit": "mW m-2 sr-1 (cm-1)-1"
+}

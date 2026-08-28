@@ -5,6 +5,7 @@ arte_atmosphere_workspace/
 .arte_atmosphere_recent.json
 .pytest_cache/
 .coverage
+.secrets/
 
 # HAPI/HITRAN local line-table cache (downloaded or imported)
 resources/data/gas_absorption/*.data
@@ -13,3 +14,15 @@ resources/data/gas_absorption/*.header
 # Downloaded global atmospheric-profile archives and temporary chunks
 resources/data/atmospheric_profiles/merra2_global_*/
 resources/data/atmospheric_profiles/gfs_global_*/
+
+# Downloaded/generated Earth-environment satellite products
+resources/data/earth_environment/
+
+# Downloaded/generated satellite-spectrum binaries used for validation.
+# Keep README/manifest files available for version control.
+resources/data/satellite_spectra/**/*.nc
+resources/data/satellite_spectra/**/*.nc4
+resources/data/satellite_spectra/**/*.h5
+resources/data/satellite_spectra/**/*.hdf5
+resources/data/satellite_spectra/**/*.npz
+resources/data/satellite_spectra/**/*.part

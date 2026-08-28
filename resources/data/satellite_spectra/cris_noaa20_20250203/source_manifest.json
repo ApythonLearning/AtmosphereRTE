@@ -1,0 +1,51 @@
+{
+  "product": "SNDRJ1CrISL1B v3 and NOAA CrIS-FS-SDR",
+  "description": "NOAA-20/JPSS-1 CrIS full-spectral-resolution radiance and two extracted validation FOVs",
+  "observation_start_utc": "2025-02-03T00:00:00Z",
+  "observation_end_utc": "2025-02-03T00:41:28.783948Z",
+  "downloaded_at": "2026-08-27",
+  "official_collection": "https://www.earthdata.nasa.gov/data/catalog/ges-disc-sndrj1crisl1b-3",
+  "cmr_collection_id": "C1952167461-GES_DISC",
+  "source_url": "https://data.gesdisc.earthdata.nasa.gov/data/JPSS1_Sounder_Level1/SNDRJ1CrISL1B.3/2025/034/SNDR.J1.CRIS.20250203T0000.m06.g001.L1B.std.v03_08.G.250203073617.nc",
+  "additional_source_urls": [
+    "https://noaa-nesdis-n20-pds.s3.amazonaws.com/CrIS-FS-SDR/2025/02/03/SCRIF_j01_d20250203_t0040589_e0041287_b37365_c20250203012427168000_oeac_ops.h5",
+    "https://noaa-nesdis-n20-pds.s3.amazonaws.com/CrIS-SDR-GEO/2025/02/03/GCRSO_j01_d20250203_t0040589_e0041287_b37365_c20250203012427546000_oeac_ops.h5"
+  ],
+  "files": {
+    "SNDR.J1.CRIS.20250203T0000.m06.g001.L1B.std.v03_08.G.250203073617.nc": {
+      "bytes": 220178049,
+      "sha256": "2eadbc817f19798e38acd645973c289ca0bfab8cc29a791f7da5fbb463a6f225"
+    },
+    "cris_noaa20_20250203T0000_validation.npz": {
+      "bytes": 21234,
+      "sha256": "ca6155eb22132f9369e709bde413009427f233ec4c19c6a2cb0d3e55d797546a",
+      "generated_by": "scripts/extract_cris_validation_spectrum.py",
+      "selected_indices": {
+        "atrack": 22,
+        "xtrack": 14,
+        "fov": 4
+      }
+    },
+    "SCRIF_j01_d20250203_t0040589_e0041287_b37365_c20250203012427168000_oeac_ops.h5": {
+      "bytes": 15986813,
+      "sha256": "859c581999c8eb9db0d4966c36549c4cf3610d007d4077fe590945a5e8f37718"
+    },
+    "GCRSO_j01_d20250203_t0040589_e0041287_b37365_c20250203012427546000_oeac_ops.h5": {
+      "bytes": 92993,
+      "sha256": "365f3163c29abdfbf93656c28675d4008a3c0f683d1e4972cc606bac3106eac5"
+    },
+    "cris_noaa20_20250203T004059_45S168W_validation.npz": {
+      "bytes": 21262,
+      "sha256": "54c570e4bcdf0ac1858ee992a7d0ea8273633eb64debca309edf3f7cfbc89519",
+      "generated_by": "scripts/extract_noaa_cris_sdr_spectrum.py",
+      "selected_indices": {
+        "scan": 0,
+        "xtrack": 4,
+        "fov": 4
+      },
+      "latitude_deg": -45.344844818115234,
+      "longitude_deg": -168.39524841308594,
+      "observation_time_utc": "2025-02-03T00:40:59.783968Z"
+    }
+  }
+}

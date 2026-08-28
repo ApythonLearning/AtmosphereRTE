@@ -75,6 +75,8 @@ class SpectrumValidationDialog(QDialog):
         parent: QWidget | None = None,
         correction_handler: Callable[[], bool] | None = None,
         automatic_correction_handler: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+        cloud_fit_handler: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+        observation_geometry_handler: Callable[[dict[str, Any]], bool] | None = None,
         embedded: bool = False,
     ) -> None:
         super().__init__(parent)
@@ -91,7 +93,10 @@ class SpectrumValidationDialog(QDialog):
         self.atmospheric_result = dict(atmospheric_result)
         self._correction_handler = correction_handler
         self._automatic_correction_handler = automatic_correction_handler
+        self._cloud_fit_handler = cloud_fit_handler
+        self._observation_geometry_handler = observation_geometry_handler
         self._satellite_series: dict[str, np.ndarray] = {}
+        self._satellite_metadata: dict[str, Any] = {}
         self._comparison_result: dict[str, Any] | None = None
 
         layout = QVBoxLayout(self)
@@ -115,7 +120,7 @@ class SpectrumValidationDialog(QDialog):
         self.correction_button = QPushButton("手动配置光学厚度修正…")
         self.correction_button.setEnabled(False)
         self.correction_button.clicked.connect(self._configure_optical_depth_correction)
-        self.automatic_correction_button = QPushButton("一键自动矫正总光学厚度")
+        self.automatic_correction_button = QPushButton("一键拟合云量并矫正光学厚度")
         self.automatic_correction_button.setEnabled(False)
         self.automatic_correction_button.clicked.connect(
             self._automatically_correct_optical_depth
@@ -143,6 +148,9 @@ class SpectrumValidationDialog(QDialog):
             self.metric_table.item(row, 1).setText("-")
         self._draw_placeholder()
         self._update_simulation_summary()
+        self.compare_button.setEnabled(
+            bool(self._satellite_series and self.atmospheric_result)
+        )
 
     def _update_simulation_summary(self) -> None:
         try:
@@ -152,8 +160,31 @@ class SpectrumValidationDialog(QDialog):
                 f"{simulated['wavelength_um'][0]:.6g}–{simulated['wavelength_um'][-1]:.6g} μm，"
                 f"{simulated['value_unit']}"
             )
+            source = str(self.atmospheric_result.get("cloud_fraction_source", "未记录"))
+            fraction = self.atmospheric_result.get(
+                "effective_cloud_fraction",
+                self.atmospheric_result.get("representative_cloud_fraction"),
+            )
+            if self.atmospheric_result.get("cloud_fraction_fit_pending", False):
+                self.cloud_summary.setText(
+                    "未找到同足迹 NUCAPS 云参数；当前仅生成晴空/全云端元，"
+                    "执行绝对值光谱验证时将由卫星光谱拟合有效云量。"
+                )
+            elif source.startswith("NUCAPS同足迹"):
+                self.cloud_summary.setText(
+                    f"NUCAPS同足迹云量 {float(fraction):.2%} 仅作为弱先验；"
+                    "执行绝对值验证后，将由8.0–9.2和10.2–12.5 μm"
+                    "大气窗口拟合最终有效云量。"
+                )
+            elif fraction is not None:
+                self.cloud_summary.setText(
+                    f"云量来源：{source}；计算采用 {float(fraction):.2%}。"
+                )
+            else:
+                self.cloud_summary.setText(f"云量来源：{source}。")
         except ValueError as exc:
             self.simulation_summary.setText(str(exc))
+            self.cloud_summary.setText("尚无可判定的云量来源。")
 
     def _build_source_group(self) -> QGroupBox:
         group = QGroupBox("验证数据源与匹配设置")
@@ -162,6 +193,10 @@ class SpectrumValidationDialog(QDialog):
         self.simulation_summary = QLabel("正在读取当前仿真光谱…")
         self.simulation_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form.addRow("仿真光谱", self.simulation_summary)
+        self.cloud_summary = QLabel("云量来源将在高分辨率验证时自动判定。")
+        self.cloud_summary.setWordWrap(True)
+        self.cloud_summary.setObjectName("secondaryText")
+        form.addRow("验证云量", self.cloud_summary)
 
         file_row = QWidget()
         file_layout = QHBoxLayout(file_row)
@@ -173,6 +208,11 @@ class SpectrumValidationDialog(QDialog):
         file_layout.addWidget(self.satellite_path, 1)
         file_layout.addWidget(browse_button)
         form.addRow("卫星产品光谱", file_row)
+
+        self.geometry_summary = QLabel("尚未读取卫星观测几何。")
+        self.geometry_summary.setWordWrap(True)
+        self.geometry_summary.setObjectName("secondaryText")
+        form.addRow("观测几何", self.geometry_summary)
 
         mapping_row = QWidget()
         mapping_layout = QHBoxLayout(mapping_row)
@@ -248,10 +288,12 @@ class SpectrumValidationDialog(QDialog):
         try:
             series = self.manager.read_numeric_series(path)
             axis_name, value_name = self.manager.suggest_series(series)
+            metadata = self.manager.read_sidecar_metadata(path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "卫星产品读取失败", str(exc))
             return
         self._satellite_series = series
+        self._satellite_metadata = dict(metadata)
         self.satellite_path.setText(str(Path(path).resolve()))
         self.axis_combo.clear()
         self.value_combo.clear()
@@ -259,22 +301,105 @@ class SpectrumValidationDialog(QDialog):
         self.value_combo.addItems(series)
         self.axis_combo.setCurrentText(axis_name)
         self.value_combo.setCurrentText(value_name)
-        self.compare_button.setEnabled(True)
+        geometry_fields = (
+            "latitude_deg", "longitude_deg", "satellite_height_km",
+            "satellite_zenith_deg", "satellite_azimuth_deg",
+            "solar_zenith_deg", "solar_azimuth_deg",
+        )
+        available_geometry = {
+            name: metadata[name] for name in geometry_fields if name in metadata
+        }
+        recalculation_required = False
+        if available_geometry and self._observation_geometry_handler is not None:
+            recalculation_required = bool(
+                self._observation_geometry_handler(available_geometry)
+            )
+        if available_geometry:
+            satellite_zenith = available_geometry.get("satellite_zenith_deg", "-")
+            satellite_azimuth = available_geometry.get("satellite_azimuth_deg", "-")
+            solar_zenith = available_geometry.get("solar_zenith_deg", "-")
+            solar_azimuth = available_geometry.get("solar_azimuth_deg", "-")
+            suffix = "；请重新执行高分辨率单柱求解" if recalculation_required else ""
+            self.geometry_summary.setText(
+                f"卫星天顶角 {satellite_zenith}°，卫星方位角 {satellite_azimuth}°；"
+                f"太阳天顶角 {solar_zenith}°，太阳方位角 {solar_azimuth}°{suffix}。"
+            )
+        else:
+            self.geometry_summary.setText("该产品没有可自动读取的同名JSON观测几何。")
+        self.compare_button.setEnabled(
+            bool(self.atmospheric_result) and not recalculation_required
+        )
 
     def _compare(self) -> None:
         try:
-            simulated = self.manager.from_atmospheric_detector_result(self.atmospheric_result)
             observed = self.manager.build_spectrum(
                 self._satellite_series,
                 self.axis_combo.currentText(),
                 self.value_combo.currentText(),
                 AXIS_KINDS[self.axis_kind_combo.currentText()],
             )
+            observed.update({
+                key: self._satellite_metadata[key]
+                for key in ("instrument", "platform", "product")
+                if key in self._satellite_metadata
+            })
+            scaling = SCALING_MODES[self.scaling_combo.currentText()]
+            cloud_fit: dict[str, Any] | None = None
+            can_fit_cloud = (
+                scaling == "absolute"
+                and bool(self.atmospheric_result.get("cloud_model_enabled", False))
+                and self.atmospheric_result.get("spectral_quantity") == "radiance"
+                and "cloud_clear_total_spectral_irradiance" in self.atmospheric_result
+                and "cloud_overcast_total_spectral_irradiance" in self.atmospheric_result
+            )
+            if can_fit_cloud:
+                cloud_fit = self.manager.fit_effective_cloud_fraction(
+                    self.atmospheric_result, observed
+                )
+                cloud_fit["satellite_product"] = self.satellite_path.text()
+                if self._cloud_fit_handler is not None:
+                    updated = self._cloud_fit_handler(cloud_fit)
+                    if updated:
+                        self.atmospheric_result = dict(updated)
+                simulated = cloud_fit["simulated_spectrum"]
+                prior_fraction = cloud_fit.get("prior_cloud_fraction")
+                if prior_fraction is not None:
+                    reference_text = (
+                        f"NUCAPS先验 {float(prior_fraction):.2%}，仅施加5%弱约束"
+                    )
+                else:
+                    reference_text = (
+                        "没有可用的NUCAPS同足迹先验"
+                    )
+                windows = cloud_fit.get("fit_windows_um", [])
+                window_text = "、".join(
+                    f"{float(lower):g}–{float(upper):g} μm"
+                    for lower, upper in windows
+                )
+                self.cloud_summary.setText(
+                    f"大气窗口（{window_text}）拟合有效云量："
+                    f"{float(cloud_fit['effective_cloud_fraction']):.2%}；"
+                    f"{reference_text}。"
+                )
+            else:
+                fitted_fraction = self.atmospheric_result.get(
+                    "effective_cloud_fraction"
+                )
+                simulated = self.manager.from_atmospheric_detector_result(
+                    self.atmospheric_result,
+                    float(fitted_fraction) if fitted_fraction is not None else None,
+                )
             result = self.manager.compare(
                 simulated,
                 observed,
-                SCALING_MODES[self.scaling_combo.currentText()],
+                scaling,
             )
+            if cloud_fit is not None:
+                result["effective_cloud_fit"] = {
+                    key: value
+                    for key, value in cloud_fit.items()
+                    if key != "simulated_spectrum"
+                }
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "光谱验证失败", str(exc))
             return

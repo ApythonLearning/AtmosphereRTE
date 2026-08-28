@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,6 +43,7 @@ class AtmosphericPatternDialog(QWidget):
         self.project_dir = Path(project_dir).expanduser().resolve()
         self.manager = AtmosphericPatternManager()
         self.last_prediction: dict[str, Any] | None = None
+        self.query_inspection: dict[str, Any] | None = None
         self._build_ui()
         self.set_project_dir(self.project_dir)
 
@@ -162,6 +164,7 @@ class AtmosphericPatternDialog(QWidget):
         prediction_group = QGroupBox("可选：运行时新廓线匹配与光学厚度插值")
         prediction_form = QFormLayout(prediction_group)
         self.query_profile = QLineEdit()
+        self.query_profile.editingFinished.connect(self._inspect_query_profile_text)
         query_row = QWidget()
         query_layout = QHBoxLayout(query_row)
         query_layout.setContentsMargins(0, 0, 0, 0)
@@ -169,7 +172,19 @@ class AtmosphericPatternDialog(QWidget):
         browse_profile = QPushButton("选择廓线…")
         browse_profile.clicked.connect(self._browse_profile)
         query_layout.addWidget(browse_profile)
-        prediction_form.addRow("35层廓线CSV", query_row)
+        prediction_form.addRow("待匹配廓线", query_row)
+        self.query_for_index = QSpinBox()
+        self.query_for_index.setRange(0, 0)
+        self.query_for_index.setEnabled(False)
+        self.query_for_index.valueChanged.connect(self._update_query_profile_summary)
+        prediction_form.addRow("NUCAPS FOR索引", self.query_for_index)
+        self.query_profile_summary = QLabel("支持35层CSV或NUCAPS NetCDF（.nc/.nc4）。")
+        self.query_profile_summary.setWordWrap(True)
+        self.query_profile_summary.setObjectName("secondaryText")
+        self.query_profile_summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        prediction_form.addRow("所选观测", self.query_profile_summary)
         self.neighbor_count = QSpinBox()
         self.neighbor_count.setRange(1, 32)
         self.neighbor_count.setValue(3)
@@ -183,7 +198,7 @@ class AtmosphericPatternDialog(QWidget):
         self.interpolate_button.setEnabled(False)
         self.interpolate_button.clicked.connect(self._interpolate)
         exact_button = QPushButton("转到HAPI精算")
-        exact_button.clicked.connect(self.exactCalculationRequested.emit)
+        exact_button.clicked.connect(self._open_query_in_hapi)
         action_row.addWidget(match_button)
         action_row.addWidget(self.interpolate_button)
         action_row.addWidget(exact_button)
@@ -233,6 +248,7 @@ class AtmosphericPatternDialog(QWidget):
             "library_path": self.library_path.text().strip(),
             "model_path": str(self.manager.model_path) if self.manager.model_path else "",
             "query_profile": self.query_profile.text().strip(),
+            "query_for_index": self.query_for_index.value(),
             "method": str(self.method.currentData()),
             "latent_dimension": self.latent_dimension.value(),
             "cluster_count": self.cluster_count.value(),
@@ -243,7 +259,14 @@ class AtmosphericPatternDialog(QWidget):
 
     def restore_project_state(self, state: dict[str, Any]) -> bool:
         self.library_path.setText(str(state.get("library_path", self.library_path.text())))
-        self.query_profile.setText(str(state.get("query_profile", "")))
+        query_path = str(state.get("query_profile", ""))
+        self.query_profile.setText(query_path)
+        if query_path and Path(query_path).expanduser().is_file():
+            self._inspect_query_profile(
+                Path(query_path),
+                preferred_for_index=int(state.get("query_for_index", 0)),
+                show_error=False,
+            )
         method_index = self.method.findData(str(state.get("method", "autoencoder")))
         self.method.setCurrentIndex(max(method_index, 0))
         self.latent_dimension.setValue(int(state.get("latent_dimension", 8)))
@@ -265,7 +288,7 @@ class AtmosphericPatternDialog(QWidget):
     def set_query_profile(self, path: str | Path) -> None:
         source = Path(path).expanduser().resolve()
         if source.is_file():
-            self.query_profile.setText(str(source))
+            self._inspect_query_profile(source, show_error=False)
 
     def _browse_library(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -287,12 +310,98 @@ class AtmosphericPatternDialog(QWidget):
     def _browse_profile(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择35层大气廓线",
+            "选择待匹配大气廓线",
             self.query_profile.text() or str(self.project_dir),
-            "大气廓线 CSV (*.csv);;所有文件 (*)",
+            "大气廓线 (*.csv *.nc *.nc4);;NUCAPS NetCDF (*.nc *.nc4);;35层CSV (*.csv);;所有文件 (*)",
         )
         if path:
-            self.query_profile.setText(path)
+            self._inspect_query_profile(Path(path))
+
+    def _inspect_query_profile_text(self) -> None:
+        path = self.query_profile.text().strip()
+        if path:
+            self._inspect_query_profile(Path(path))
+
+    def _inspect_query_profile(
+        self,
+        source: Path,
+        *,
+        preferred_for_index: int | None = None,
+        show_error: bool = True,
+    ) -> bool:
+        source = source.expanduser().resolve()
+        self.query_profile.setText(str(source))
+        if source.suffix.lower() == ".csv":
+            self.query_inspection = None
+            self.query_for_index.blockSignals(True)
+            self.query_for_index.setRange(0, 0)
+            self.query_for_index.setValue(0)
+            self.query_for_index.blockSignals(False)
+            self.query_for_index.setEnabled(False)
+            self.query_profile_summary.setText("35层CSV单廓线；无需选择FOR索引。")
+            return True
+        if source.suffix.lower() not in {".nc", ".nc4"}:
+            message = "待匹配廓线仅支持35层CSV或NUCAPS NetCDF（.nc/.nc4）。"
+            self.query_profile_summary.setText(message)
+            if show_error:
+                QMessageBox.warning(self, "大气廓线读取失败", message)
+            return False
+        try:
+            from core.hapi_optical_depth_manager import NucapsAtmosphericProfileReader
+
+            inspection = NucapsAtmosphericProfileReader.inspect(source)
+            profile_count = int(inspection["profile_count"])
+            if profile_count <= 0:
+                raise ValueError("NUCAPS文件中没有大气廓线。")
+            quality = np.asarray(inspection["quality_flag"], dtype=float)
+            levels = np.asarray(inspection["valid_level_count"], dtype=int)
+            valid = np.flatnonzero(
+                np.isfinite(quality) & (quality == 0) & (levels >= 2)
+            )
+            if not valid.size:
+                valid = np.flatnonzero(levels >= 2)
+            if not valid.size:
+                raise ValueError("NUCAPS文件中没有有效温压廓线。")
+            selected = (
+                int(preferred_for_index)
+                if preferred_for_index is not None
+                and 0 <= int(preferred_for_index) < profile_count
+                and levels[int(preferred_for_index)] >= 2
+                else int(valid[0])
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.query_inspection = None
+            self.query_for_index.setEnabled(False)
+            self.query_profile_summary.setText(str(exc))
+            if show_error:
+                QMessageBox.warning(self, "NUCAPS廓线读取失败", str(exc))
+            return False
+        self.query_inspection = inspection
+        self.query_for_index.blockSignals(True)
+        self.query_for_index.setRange(0, profile_count - 1)
+        self.query_for_index.setValue(selected)
+        self.query_for_index.blockSignals(False)
+        self.query_for_index.setEnabled(True)
+        self._update_query_profile_summary()
+        return True
+
+    def _update_query_profile_summary(self) -> None:
+        if self.query_inspection is None:
+            return
+        try:
+            from core.hapi_optical_depth_manager import NucapsAtmosphericProfileReader
+
+            summary = NucapsAtmosphericProfileReader.profile_summary(
+                self.query_inspection, self.query_for_index.value()
+            )
+            self.query_profile_summary.setText(
+                f"FOR {summary['for_index']}；{summary['observation_time_utc']}；"
+                f"{summary['latitude_deg']:.7f}°, {summary['longitude_deg']:.7f}°；"
+                f"Quality_Flag={summary['quality_flag']}；"
+                f"有效温压层={summary['valid_level_count']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.query_profile_summary.setText(str(exc))
 
     def _train(self) -> None:
         try:
@@ -577,7 +686,9 @@ class AtmosphericPatternDialog(QWidget):
     def _match(self) -> None:
         try:
             result = self.manager.predict(
-                self.query_profile.text(), self.neighbor_count.value()
+                self.query_profile.text(),
+                self.neighbor_count.value(),
+                for_index=self.query_for_index.value(),
             )
             self.last_prediction = result
             self._show_prediction(result)
@@ -585,6 +696,15 @@ class AtmosphericPatternDialog(QWidget):
             self.last_prediction = None
             self.interpolate_button.setEnabled(False)
             QMessageBox.warning(self, "大气状态匹配失败", str(exc))
+
+    def _open_query_in_hapi(self) -> None:
+        source = Path(self.query_profile.text()).expanduser()
+        if source.is_file() and source.suffix.lower() in {".csv", ".nc", ".nc4"}:
+            self.exactProfileRequested.emit(
+                str(source.resolve()), self.query_for_index.value()
+            )
+        else:
+            self.exactCalculationRequested.emit()
 
     def _show_prediction(self, result: dict[str, Any]) -> None:
         outside = bool(result["out_of_distribution"])

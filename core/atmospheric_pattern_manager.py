@@ -97,10 +97,17 @@ class AtmosphericPatternManager:
         return sorted(root.rglob(PROFILE_FILENAME))
 
     @classmethod
-    def read_profile(cls, path: str | Path) -> ProfileRecord:
+    def read_profile(cls, path: str | Path, for_index: int = 0) -> ProfileRecord:
         source = Path(path).expanduser().resolve()
         if not source.is_file():
             raise FileNotFoundError(f"廓线文件不存在：{source}")
+        if source.suffix.lower() in {".nc", ".nc4"}:
+            from core.hapi_optical_depth_manager import NucapsAtmosphericProfileReader
+
+            profile = NucapsAtmosphericProfileReader.read(source, int(for_index))
+            return cls._record_from_layered_profile(profile, "NUCAPS")
+        if source.suffix.lower() != ".csv":
+            raise ValueError("待匹配廓线仅支持35层CSV或NUCAPS NetCDF（.nc/.nc4）。")
         with source.open("r", encoding="utf-8-sig") as stream:
             header = stream.readline().strip()
         columns = tuple(item.strip() for item in header.split(","))
@@ -628,10 +635,20 @@ class AtmosphericPatternManager:
         rmse = float(np.sqrt(np.mean((reconstructed - standardized) ** 2)))
         return score, rmse
 
-    def predict(self, profile: ProfileRecord | str | Path, neighbor_count: int = 3) -> dict[str, Any]:
+    def predict(
+        self,
+        profile: ProfileRecord | str | Path,
+        neighbor_count: int = 3,
+        *,
+        for_index: int = 0,
+    ) -> dict[str, Any]:
         if not self.is_fitted:
             raise RuntimeError("尚未训练或读取大气状态模式模型。")
-        record = self.read_profile(profile) if not isinstance(profile, ProfileRecord) else profile
+        record = (
+            self.read_profile(profile, for_index=for_index)
+            if not isinstance(profile, ProfileRecord)
+            else profile
+        )
         vector = self._profile_feature_vector(record, self.feature_columns, self.layer_count)
         score, reconstruction_rmse = self._encode(vector)
         representative_distances = np.linalg.norm(self.representative_scores - score, axis=1)
@@ -652,6 +669,8 @@ class AtmosphericPatternManager:
         confidence = float(np.exp(-center_distance / max(self.distance_threshold, 1.0e-12)))
         result: dict[str, Any] = {
             "profile_file": str(record.path),
+            "profile_for_index": int(record.metadata.get("for_index", for_index)),
+            "profile_metadata": dict(record.metadata),
             "neighbor_indices": selected.astype(int),
             "distances": selected_distances,
             "weights": weights,

@@ -1,0 +1,32 @@
+{
+  "source_file": "SNDR.J1.CRIS.20250203T0000.m06.g001.L1B.std.v03_08.G.250203073617.nc",
+  "product": "SNDRJ1CrISL1B",
+  "platform": "JPSS-1 > Joint Polar Satellite System - 1",
+  "instrument": "CrIS > Cross-track Infrared Sounder",
+  "title": "JPSS-1 CrIS Level-1B FSR",
+  "time_coverage_start": "2025-02-03T00:00:00.00Z",
+  "time_coverage_end": "2025-02-03T00:06:00.00Z",
+  "indices": {
+    "atrack": 22,
+    "xtrack": 14,
+    "fov": 4
+  },
+  "latitude_deg": -0.6511248350143433,
+  "longitude_deg": 20.21051025390625,
+  "satellite_zenith_deg": 1.7952278852462769,
+  "quality_flags": {
+    "rad_lw_qc": 0,
+    "rad_mw_qc": 0,
+    "rad_sw_qc": 0
+  },
+  "channel_counts": {
+    "LW": 717,
+    "MW": 869,
+    "SW": 637
+  },
+  "spectral_point_count": 2223,
+  "wavenumber_min_cm-1": 648.75,
+  "wavenumber_max_cm-1": 2551.25,
+  "radiance_unit": "W m-2 sr-1 um-1",
+  "source_radiance_unit": "mW m-2 sr-1 (cm-1)-1"
+}

@@ -26,13 +26,67 @@ SOLAR_REFERENCE_PATH = (
 
 def build_specified_location_sample(parameters: dict[str, Any]) -> dict[str, float]:
     """由界面参数构造不依赖航迹的指定位置大气辐射求解样本。"""
+    latitude = float(parameters.get("specified_latitude_deg", 0.0))
+    longitude = float(parameters.get("specified_longitude_deg", 0.0))
+    if "specified_solar_zenith_deg" in parameters:
+        solar_zenith = float(parameters["specified_solar_zenith_deg"])
+        solar_azimuth = float(parameters.get("specified_solar_azimuth_deg", 180.0))
+    else:
+        # 兼容旧项目：按旧版地固近似把赤经/赤纬换算为目标点太阳天顶角。
+        right_ascension = np.deg2rad(
+            float(parameters.get("specified_solar_right_ascension_deg", 0.0))
+        )
+        declination = np.deg2rad(
+            float(parameters.get("specified_solar_declination_deg", 0.0))
+        )
+        latitude_rad = np.deg2rad(latitude)
+        longitude_rad = np.deg2rad(longitude)
+        cosine_zenith = (
+            np.sin(latitude_rad) * np.sin(declination)
+            + np.cos(latitude_rad)
+            * np.cos(declination)
+            * np.cos(longitude_rad - right_ascension)
+        )
+        solar_zenith = float(
+            np.rad2deg(np.arccos(np.clip(cosine_zenith, -1.0, 1.0)))
+        )
+        legacy_sun = np.asarray([
+            np.cos(declination) * np.cos(right_ascension),
+            np.cos(declination) * np.sin(right_ascension),
+            np.sin(declination),
+        ])
+        local_north = np.asarray([
+            -np.sin(latitude_rad) * np.cos(longitude_rad),
+            -np.sin(latitude_rad) * np.sin(longitude_rad),
+            np.cos(latitude_rad),
+        ])
+        local_east = np.asarray([
+            -np.sin(longitude_rad),
+            np.cos(longitude_rad),
+            0.0,
+        ])
+        solar_azimuth = float(
+            np.rad2deg(
+                np.arctan2(
+                    np.dot(legacy_sun, local_east),
+                    np.dot(legacy_sun, local_north),
+                )
+            )
+            % 360.0
+        )
     values = {
         "time": float(parameters.get("specified_time_s", 0.0)),
-        "lat": float(parameters.get("specified_latitude_deg", 0.0)),
-        "lon": float(parameters.get("specified_longitude_deg", 0.0)),
+        "lat": latitude,
+        "lon": longitude,
         "alt": float(parameters.get("specified_altitude", 700.0)),
-        "right_ascension": float(parameters.get("specified_solar_right_ascension_deg", 0.0)),
-        "declination": float(parameters.get("specified_solar_declination_deg", 0.0)),
+        "solar_zenith": solar_zenith,
+        "solar_azimuth": solar_azimuth,
+        "view_zenith": float(
+            parameters.get("specified_satellite_zenith_deg", 0.0)
+        ),
+        "view_azimuth": float(
+            parameters.get("specified_satellite_azimuth_deg", 0.0)
+        ),
     }
     if not all(np.isfinite(value) for value in values.values()):
         raise ValueError("指定位置、时刻和太阳方向参数必须是有限数值。")
@@ -42,10 +96,14 @@ def build_specified_location_sample(parameters: dict[str, Any]) -> dict[str, flo
         raise ValueError("指定位置经度必须在 -180～180° 范围内。")
     if values["alt"] <= 0.0:
         raise ValueError("指定位置观测高度必须大于 0。")
-    if not -360.0 <= values["right_ascension"] <= 360.0:
-        raise ValueError("指定太阳赤经必须在 -360～360° 范围内。")
-    if not -90.0 <= values["declination"] <= 90.0:
-        raise ValueError("指定太阳赤纬必须在 -90～90° 范围内。")
+    if not 0.0 <= values["solar_zenith"] <= 180.0:
+        raise ValueError("指定太阳天顶角必须在 0～180° 范围内。")
+    if not 0.0 <= values["solar_azimuth"] <= 360.0:
+        raise ValueError("指定太阳方位角必须在 0～360° 范围内。")
+    if not 0.0 <= values["view_zenith"] < 90.0:
+        raise ValueError("指定卫星天顶角必须在 0～90° 范围内（不含90°）。")
+    if not 0.0 <= values["view_azimuth"] <= 360.0:
+        raise ValueError("指定卫星方位角必须在 0～360° 范围内。")
     return {
         **values,
         "sun_x": 1.0,
@@ -55,6 +113,120 @@ def build_specified_location_sample(parameters: dict[str, Any]) -> dict[str, flo
         "earth_y": 0.0,
         "earth_z": -1.0,
     }
+
+
+def solar_direction_from_sample(sample: dict[str, Any]) -> np.ndarray:
+    """返回地固太阳单位向量；方位角从正北起顺时针增加。"""
+    if "solar_zenith" in sample:
+        zenith_deg = float(sample["solar_zenith"])
+        azimuth_deg = float(sample.get("solar_azimuth", 180.0))
+        if not 0.0 <= zenith_deg <= 180.0:
+            raise ValueError("太阳天顶角必须在 0～180° 范围内。")
+        if not 0.0 <= azimuth_deg <= 360.0:
+            raise ValueError("太阳方位角必须在 0～360° 范围内。")
+        latitude = np.deg2rad(float(sample["lat"]))
+        longitude = np.deg2rad(float(sample["lon"]))
+        zenith = np.deg2rad(zenith_deg)
+        azimuth = np.deg2rad(azimuth_deg)
+        local_up = np.asarray([
+            np.cos(latitude) * np.cos(longitude),
+            np.cos(latitude) * np.sin(longitude),
+            np.sin(latitude),
+        ])
+        local_north = np.asarray([
+            -np.sin(latitude) * np.cos(longitude),
+            -np.sin(latitude) * np.sin(longitude),
+            np.cos(latitude),
+        ])
+        local_east = np.asarray([
+            -np.sin(longitude),
+            np.cos(longitude),
+            0.0,
+        ])
+        horizontal = np.cos(azimuth) * local_north + np.sin(azimuth) * local_east
+        direction = np.cos(zenith) * local_up + np.sin(zenith) * horizontal
+        return direction / max(float(np.linalg.norm(direction)), 1e-30)
+
+    # 兼容尚未迁移的轨迹样本。
+    sun_lon = np.deg2rad(float(sample.get("right_ascension", 0.0)))
+    sun_lat = np.deg2rad(float(sample.get("declination", 0.0)))
+    return np.asarray([
+        np.cos(sun_lat) * np.cos(sun_lon),
+        np.cos(sun_lat) * np.sin(sun_lon),
+        np.sin(sun_lat),
+    ])
+
+
+def local_direction_from_zenith_azimuth(
+    latitude_deg: float,
+    longitude_deg: float,
+    zenith_deg: float,
+    azimuth_deg: float,
+) -> np.ndarray:
+    """将局地天顶角/方位角转换为地固单位向量。
+
+    方位角从正北起顺时针计量。返回方向由地表足迹指向辐射源或传感器。
+    """
+    latitude = np.deg2rad(float(latitude_deg))
+    longitude = np.deg2rad(float(longitude_deg))
+    zenith = np.deg2rad(float(zenith_deg))
+    azimuth = np.deg2rad(float(azimuth_deg))
+    local_up = np.asarray([
+        np.cos(latitude) * np.cos(longitude),
+        np.cos(latitude) * np.sin(longitude),
+        np.sin(latitude),
+    ])
+    local_north = np.asarray([
+        -np.sin(latitude) * np.cos(longitude),
+        -np.sin(latitude) * np.sin(longitude),
+        np.cos(latitude),
+    ])
+    local_east = np.asarray([
+        -np.sin(longitude),
+        np.cos(longitude),
+        0.0,
+    ])
+    horizontal = np.cos(azimuth) * local_north + np.sin(azimuth) * local_east
+    direction = np.cos(zenith) * local_up + np.sin(zenith) * horizontal
+    return direction / max(float(np.linalg.norm(direction)), 1e-30)
+
+
+def solar_zenith_from_sample(sample: dict[str, Any]) -> float:
+    """返回目标点局地太阳天顶角，兼容旧式太阳方向样本。"""
+    if "solar_zenith" in sample:
+        return float(sample["solar_zenith"])
+    latitude = np.deg2rad(float(sample["lat"]))
+    longitude = np.deg2rad(float(sample["lon"]))
+    local_up = np.asarray([
+        np.cos(latitude) * np.cos(longitude),
+        np.cos(latitude) * np.sin(longitude),
+        np.sin(latitude),
+    ])
+    cosine_zenith = float(np.dot(local_up, solar_direction_from_sample(sample)))
+    return float(np.rad2deg(np.arccos(np.clip(cosine_zenith, -1.0, 1.0))))
+
+
+def solar_azimuth_from_sample(sample: dict[str, Any]) -> float:
+    """返回从局地正北起顺时针计量的太阳方位角。"""
+    if "solar_zenith" in sample:
+        return float(sample.get("solar_azimuth", 180.0))
+    latitude = np.deg2rad(float(sample["lat"]))
+    longitude = np.deg2rad(float(sample["lon"]))
+    local_north = np.asarray([
+        -np.sin(latitude) * np.cos(longitude),
+        -np.sin(latitude) * np.sin(longitude),
+        np.cos(latitude),
+    ])
+    local_east = np.asarray([
+        -np.sin(longitude),
+        np.cos(longitude),
+        0.0,
+    ])
+    sun = solar_direction_from_sample(sample)
+    return float(
+        np.rad2deg(np.arctan2(np.dot(sun, local_east), np.dot(sun, local_north)))
+        % 360.0
+    )
 
 
 @dataclass
@@ -451,6 +623,7 @@ class ModisDataManager:
 
     LAND_TEMP_NAMES = ("LST_Day_CMG", "LST_Day", "Land_Surface_Temperature")
     SEA_TEMP_NAMES = ("SST", "sst", "sea_surface_temperature")
+    CACHE_PROCESSING_VERSION = 5
     LAND_TYPE_NAMES = ("Majority_Land_Cover_Type_1", "LC_Type1", "Land_Cover_Type_1")
     CLOUD_FRACTION_NAMES = ("Cloud_Fraction_Mean_Mean", "Cloud_Fraction_Mean")
     CLOUD_TEMP_NAMES = ("Cloud_Top_Temperature_Mean_Mean", "Cloud_Top_Temperature_Mean")
@@ -655,7 +828,8 @@ class ModisDataManager:
         if resolution <= 0 or resolution > 10:
             raise ValueError("地球网格分辨率必须在 0 到 10 度之间。")
         land_t = self._read_named_dataset(Path(land_temperature_file), self.LAND_TEMP_NAMES, "陆地温度")
-        sea_t = self._read_named_dataset(Path(sea_temperature_file), self.SEA_TEMP_NAMES, "海表温度")
+        sea_temperature_path = Path(sea_temperature_file)
+        sea_t = self._read_named_dataset(sea_temperature_path, self.SEA_TEMP_NAMES, "海表温度")
         land_type = self._read_named_dataset(Path(land_type_file), self.LAND_TYPE_NAMES, "地表类型")
         cloud_fraction = self._read_named_dataset(Path(cloud_file), self.CLOUD_FRACTION_NAMES, "云量")
         cloud_t = self._read_named_dataset(Path(cloud_file), self.CLOUD_TEMP_NAMES, "云顶温度")
@@ -676,8 +850,11 @@ class ModisDataManager:
         land_t = self._resample_continuous(land_t, shape)
         sea_t = self._to_kelvin(sea_t, "sea")
         sea_t[~np.isfinite(sea_t) | (sea_t < 268.15) | (sea_t > 323.15)] = np.nan
-        # MOD28 NetCDF纬度由南向北排列，统一为第0行对应北纬90度。
-        sea_t = self._resample_continuous(np.flipud(sea_t), shape)
+        # 旧MOD28文件常为南到北，新版OB.DAAC Terra MODIS L3m则为北到南。
+        # 优先读取文件纬度坐标，无法识别时保留旧MOD28的翻转行为。
+        if not self._is_north_first(sea_temperature_path, sea_t.shape[0]):
+            sea_t = np.flipud(sea_t)
+        sea_t = self._resample_continuous(sea_t, shape)
         land_type = self._resample(land_type, shape, nearest=True).astype(np.int16)
         cloud_fraction_raw = np.asarray(cloud_fraction, dtype=float)
         cloud_fraction = self._normalise_fraction(cloud_fraction_raw)
@@ -696,13 +873,16 @@ class ModisDataManager:
             cloud_optical_thickness_raw, shape
         )
 
-        land_valid = np.isfinite(land_t)
-        sea_valid = np.isfinite(sea_t)
-        surface_t = np.where(
-            land_valid & sea_valid,
-            0.5 * (land_t + sea_t),
-            np.where(land_valid, land_t, np.where(sea_valid, sea_t, np.nan)),
-        )
+        # MOD11C1和MODIS L3 SST都是晴空红外反演，单日产品会因云遮挡存在
+        # 大量缺测。不能将全部缺测统一替换成全球均温，否则会产生大片同色区域。
+        # 先按地表类型严格选择陆温/海温，再分别在陆地和海洋内部做最近观测填补，
+        # 避免陆温跨海传播或海温覆盖陆地。
+        water_mask = np.rint(land_type).astype(np.int16) == 0
+        land_observed = np.isfinite(land_t) & ~water_mask
+        sea_observed = np.isfinite(sea_t) & water_mask
+        surface_t = np.where(water_mask, sea_t, land_t)
+        surface_t = self._fill_missing_spatial(surface_t, water_mask, 288.15)
+        surface_t = self._fill_missing_spatial(surface_t, ~water_mask, 288.15)
         surface_t = self._fill_missing(surface_t, 288.15)
         albedo, emissivity = self._surface_properties(land_type)
         cloud_t_valid = np.isfinite(cloud_t) & (cloud_t > 150.0) & (cloud_t < 330.0)
@@ -746,7 +926,14 @@ class ModisDataManager:
                 "resolution_deg": resolution,
                 "source_paths": paths,
                 "loaded_at": datetime.now().isoformat(timespec="seconds"),
-                "processing_version": 4,
+                "processing_version": self.CACHE_PROCESSING_VERSION,
+                "surface_temperature_fill_method": "nearest_same_surface_periodic_longitude",
+                "land_temperature_observed_fraction": float(
+                    land_observed.sum() / max(1, (~water_mask).sum())
+                ),
+                "sea_temperature_observed_fraction": float(
+                    sea_observed.sum() / max(1, water_mask.sum())
+                ),
                 "cloud_effective_radius_source": "modis_with_empirical_fallback" if direct_re.any() else "empirical",
                 "cloud_liquid_water_path_source": (
                     "modis_with_optical_thickness_and_empirical_fallback"
@@ -769,7 +956,7 @@ class ModisDataManager:
         target.parent.mkdir(parents=True, exist_ok=True)
         grid = self._grid
         metadata = dict(grid.metadata)
-        metadata["processing_version"] = 4
+        metadata["processing_version"] = self.CACHE_PROCESSING_VERSION
         cloud_re, cloud_lwp = self._grid_cloud_microphysics(grid)
         np.savez_compressed(
             target, latitude=grid.latitude, longitude=grid.longitude,
@@ -787,8 +974,8 @@ class ModisDataManager:
         source = Path(path).expanduser().resolve()
         with np.load(source, allow_pickle=False) as data:
             metadata = json.loads(str(data["metadata_json"].item())) if "metadata_json" in data else {}
-            if int(metadata.get("processing_version", 0)) < 3:
-                raise ValueError("环境缓存由旧版MODIS温度处理生成，请重新读取原始MODIS数据。")
+            if int(metadata.get("processing_version", 0)) < self.CACHE_PROCESSING_VERSION:
+                raise ValueError("环境缓存由旧版MODIS温度处理生成，需要从原始产品自动重建。")
             fields = {key: np.asarray(data[key]) for key in (
                 "latitude", "longitude", "surface_temperature_k", "surface_type",
                 "surface_albedo", "surface_emissivity", "cloud_fraction",
@@ -830,7 +1017,7 @@ class ModisDataManager:
                 found: list[np.ndarray] = []
                 def visitor(name: str, obj: Any) -> None:
                     if hasattr(obj, "shape") and name.rsplit("/", 1)[-1] in names:
-                        found.append(np.asarray(obj[...], dtype=float))
+                        found.append(self._unpack_numeric(obj[...], obj.attrs))
                 handle.visititems(visitor)
                 if found:
                     return np.squeeze(found[0])
@@ -844,7 +1031,10 @@ class ModisDataManager:
                 dataset = SD(str(path))
                 key = next((name for name in names if name in dataset.datasets()), None)
                 if key is not None:
-                    return np.asarray(dataset.select(key).get(), dtype=float).squeeze()
+                    selected = dataset.select(key)
+                    return self._unpack_numeric(
+                        selected.get(), selected.attributes()
+                    ).squeeze()
             except ImportError as exc:
                 raise RuntimeError(f"无法读取{label}。HDF4 产品需要安装 pyhdf。") from exc
         try:
@@ -861,6 +1051,104 @@ class ModisDataManager:
         except OSError:
             pass
         raise KeyError(f"{path.name} 中未找到{label}数据集：{', '.join(names)}")
+
+    @staticmethod
+    def _unpack_numeric(values: Any, attributes: Any) -> np.ndarray:
+        """按 HDF/NetCDF 属性屏蔽填充值并解包压缩整数。"""
+        raw = np.asarray(values, dtype=float)
+        invalid = ~np.isfinite(raw)
+
+        def attribute(name: str, default: Any = None) -> Any:
+            try:
+                return attributes.get(name, default)
+            except AttributeError:
+                return default
+
+        for name in ("_FillValue", "missing_value"):
+            marker = attribute(name)
+            if marker is not None:
+                marker_values = np.asarray(marker, dtype=float).reshape(-1)
+                for marker_value in marker_values:
+                    if np.isfinite(marker_value):
+                        invalid |= raw == marker_value
+
+        valid_range = attribute("valid_range")
+        if valid_range is not None:
+            limits = np.asarray(valid_range, dtype=float).reshape(-1)
+            if limits.size >= 2:
+                invalid |= (raw < limits[0]) | (raw > limits[1])
+        else:
+            valid_min = attribute("valid_min")
+            valid_max = attribute("valid_max")
+            if valid_min is not None:
+                invalid |= raw < float(np.asarray(valid_min).reshape(-1)[0])
+            if valid_max is not None:
+                invalid |= raw > float(np.asarray(valid_max).reshape(-1)[0])
+
+        scale = float(np.asarray(attribute("scale_factor", 1.0)).reshape(-1)[0])
+        offset = float(np.asarray(attribute("add_offset", 0.0)).reshape(-1)[0])
+        unpacked = raw * scale + offset
+        unpacked[invalid] = np.nan
+        return unpacked
+
+    @staticmethod
+    def _is_north_first(path: Path, row_count: int) -> bool:
+        """判断二维产品第0行是否位于北侧；缺少坐标时沿用旧MOD28约定。"""
+
+        def north_first(latitude: Any) -> bool | None:
+            values = np.asarray(latitude, dtype=float).squeeze()
+            if values.ndim == 1 and values.size == row_count:
+                first, last = float(values[0]), float(values[-1])
+            elif values.ndim == 2 and values.shape[0] == row_count:
+                first = float(np.nanmean(values[0]))
+                last = float(np.nanmean(values[-1]))
+            else:
+                return None
+            if not np.isfinite(first) or not np.isfinite(last) or first == last:
+                return None
+            return first > last
+
+        resolved = path.expanduser().resolve()
+        if resolved.suffix.lower() == ".npz":
+            try:
+                with np.load(resolved, allow_pickle=False) as data:
+                    for name in ("lat", "latitude", "Latitude"):
+                        if name in data:
+                            result = north_first(data[name])
+                            if result is not None:
+                                return result
+            except (OSError, ValueError):
+                pass
+        try:
+            import h5py  # type: ignore
+            with h5py.File(resolved, "r") as handle:
+                candidates: list[np.ndarray] = []
+
+                def visitor(name: str, obj: Any) -> None:
+                    if (
+                        hasattr(obj, "shape")
+                        and name.rsplit("/", 1)[-1] in ("lat", "latitude", "Latitude")
+                    ):
+                        candidates.append(np.asarray(obj[...], dtype=float))
+
+                handle.visititems(visitor)
+                for candidate in candidates:
+                    result = north_first(candidate)
+                    if result is not None:
+                        return result
+        except (ImportError, OSError):
+            pass
+        try:
+            from netCDF4 import Dataset  # type: ignore
+            with Dataset(resolved) as dataset:
+                for name in ("lat", "latitude", "Latitude"):
+                    if name in dataset.variables:
+                        result = north_first(dataset.variables[name][:])
+                        if result is not None:
+                            return result
+        except (ImportError, OSError):
+            pass
+        return False
 
     def _read_named_dataset_optional(self, path: Path, names: tuple[str, ...]) -> np.ndarray | None:
         try:
@@ -1024,6 +1312,64 @@ class ModisDataManager:
         array[~valid] = fill
         return array
 
+    def _fill_missing_spatial(
+        self,
+        values: np.ndarray,
+        domain_mask: np.ndarray,
+        default: float,
+    ) -> np.ndarray:
+        """仅在指定地表域内用最近有效像元填补，且经度方向周期连续。"""
+        array = np.asarray(values, dtype=float).copy()
+        domain = np.asarray(domain_mask, dtype=bool)
+        if array.shape != domain.shape:
+            raise ValueError("温度数组与地表域掩膜形状不一致。")
+        missing = domain & ~np.isfinite(array)
+        if not np.any(missing):
+            return array
+        valid = domain & np.isfinite(array)
+        if not np.any(valid):
+            array[missing] = float(default)
+            return array
+
+        # 将经度复制三份后在中间一份求最近点，保证日期变更线两侧相邻。
+        tiled_values = np.concatenate((array, array, array), axis=1)
+        tiled_valid = np.concatenate((valid, valid, valid), axis=1)
+        columns = array.shape[1]
+        try:
+            from scipy.ndimage import distance_transform_edt  # type: ignore
+
+            nearest = distance_transform_edt(
+                ~tiled_valid, return_distances=False, return_indices=True
+            )
+            filled = tiled_values[tuple(nearest)][:, columns : 2 * columns]
+            array[missing] = filled[missing]
+            return array
+        except ImportError:
+            pass
+
+        # 无scipy时逐圈传播相邻有效值；纬度不跨极点，经度保持周期。
+        for _ in range(array.shape[0] + array.shape[1]):
+            missing = domain & ~np.isfinite(array)
+            if not np.any(missing):
+                break
+            total = np.zeros(array.shape, dtype=float)
+            count = np.zeros(array.shape, dtype=np.int16)
+            current_valid = domain & np.isfinite(array)
+            for shift, axis in ((1, 0), (-1, 0), (1, 1), (-1, 1)):
+                neighbor = np.roll(array, shift, axis=axis)
+                neighbor_valid = np.roll(current_valid, shift, axis=axis)
+                if axis == 0:
+                    neighbor_valid[0 if shift > 0 else -1, :] = False
+                total += np.where(neighbor_valid, neighbor, 0.0)
+                count += neighbor_valid
+            update = missing & (count > 0)
+            if not np.any(update):
+                break
+            array[update] = total[update] / count[update]
+        remaining = domain & ~np.isfinite(array)
+        array[remaining] = float(default)
+        return array
+
     def _surface_properties(self, land_type: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         surface_type = np.asarray(land_type)
         albedo = np.full(surface_type.shape, 0.18, dtype=float)
@@ -1069,7 +1415,9 @@ class LayeredAtmosphereSolver:
             [0, 11, 20, 32, 47, 51, 71, 86, 100],
             [288.15, 216.65, 216.65, 228.65, 270.65, 270.65, 214.65, 186.87, 195.08],
         )
-        self.temperature_k = self._standard_temperature_k.copy()
+        self._base_temperature_k = self._standard_temperature_k.copy()
+        self.temperature_k = self._base_temperature_k.copy()
+        self._temperature_profile_source = "内置标准大气"
         self._upper_atmosphere_temperature_offset_k = 0.0
         self._absorption_wavenumber: np.ndarray | None = None
         self._absorption_tau: np.ndarray | None = None
@@ -1082,9 +1430,9 @@ class LayeredAtmosphereSolver:
     def set_upper_atmosphere_temperature_offset(
         self, offset_k: float, minimum_altitude_km: float = 10.0
     ) -> float:
-        """从标准廓线重建温度，并只偏移指定高度以上的大气层。"""
+        """从当前基础廓线重建温度，并只偏移指定高度以上的大气层。"""
         offset = float(np.clip(float(offset_k), -15.0, 15.0))
-        self.temperature_k = self._standard_temperature_k.copy()
+        self.temperature_k = self._base_temperature_k.copy()
         self.temperature_k[self.altitude_mid_km >= float(minimum_altitude_km)] += offset
         self._upper_atmosphere_temperature_offset_k = offset
         return offset
@@ -1102,6 +1450,83 @@ class LayeredAtmosphereSolver:
         self._absorption_tau = tau.copy()
         self._absorption_sources = [str(source)]
         self._optical_depth_corrections = []
+        self._load_sibling_temperature_profile(source)
+
+    def _load_sibling_temperature_profile(self, optical_depth_path: Path) -> None:
+        """优先加载HAPI结果目录中的同廓线35层温度。
+
+        HAPI光学厚度与生成它的温压廓线必须成对使用。缺少同目录廓线时
+        回退到内置标准大气；存在但内容损坏时明确报错，避免悄悄混用。
+        """
+        self._base_temperature_k = self._standard_temperature_k.copy()
+        self.temperature_k = self._base_temperature_k.copy()
+        self._temperature_profile_source = "内置标准大气"
+        candidates = [optical_depth_path.parent / "atmospheric_profile_35_layers.csv"]
+        candidates.extend(sorted(
+            path for path in optical_depth_path.parent.glob("*35_layers*.csv")
+            if path not in candidates
+        ))
+        profile_path = next((path for path in candidates if path.is_file()), None)
+        if profile_path is None:
+            return
+
+        table = pd.read_csv(profile_path)
+        normalized_names = {
+            str(column).strip().lower().replace(" ", "").replace("_", ""): column
+            for column in table.columns
+        }
+        temperature_column = next(
+            (
+                original
+                for normalized, original in normalized_names.items()
+                if normalized in {"temperature(k)", "temperaturek", "temperature"}
+                or normalized.startswith("temperature(")
+            ),
+            None,
+        )
+        if temperature_column is None:
+            raise ValueError(f"同目录大气廓线缺少温度列：{profile_path}")
+        temperature = pd.to_numeric(table[temperature_column], errors="coerce").to_numpy(dtype=float)
+        valid_temperature = np.isfinite(temperature) & (temperature > 100.0) & (temperature < 400.0)
+        if np.count_nonzero(valid_temperature) < 2:
+            raise ValueError(f"同目录大气廓线没有足够的有效温度层：{profile_path}")
+
+        altitude_column = next(
+            (
+                original
+                for normalized, original in normalized_names.items()
+                if normalized in {
+                    "altitudemid(km)", "altitudemidkm", "altitude(km)",
+                    "altitudekm", "height(km)", "heightkm",
+                }
+            ),
+            None,
+        )
+        if altitude_column is not None:
+            altitude = pd.to_numeric(table[altitude_column], errors="coerce").to_numpy(dtype=float)
+            valid = valid_temperature & np.isfinite(altitude)
+            altitude = altitude[valid]
+            temperature = temperature[valid]
+            order = np.argsort(altitude)
+            altitude = altitude[order]
+            temperature = temperature[order]
+            altitude, unique_indices = np.unique(altitude, return_index=True)
+            temperature = temperature[unique_indices]
+            if altitude.size < 2:
+                raise ValueError(f"同目录大气廓线没有足够的唯一高度层：{profile_path}")
+            mapped_temperature = np.interp(
+                self.altitude_mid_km, altitude, temperature,
+                left=temperature[0], right=temperature[-1],
+            )
+        else:
+            temperature = temperature[valid_temperature]
+            source_coordinate = np.linspace(0.0, 1.0, temperature.size)
+            target_coordinate = np.linspace(0.0, 1.0, self.altitude_mid_km.size)
+            mapped_temperature = np.interp(target_coordinate, source_coordinate, temperature)
+
+        self._base_temperature_k = np.asarray(mapped_temperature, dtype=float)
+        self.temperature_k = self._base_temperature_k.copy()
+        self._temperature_profile_source = str(profile_path.resolve())
 
     @staticmethod
     def normalize_optical_depth_corrections(
@@ -1236,6 +1661,9 @@ class LayeredAtmosphereSolver:
             "wavenumber_cm": wavenumber,
             "total_tau_layers": self._absorption_tau,
             "sources": list(self._absorption_sources),
+            "altitude_mid_km": self.altitude_mid_km.copy(),
+            "temperature_k": self.temperature_k.copy(),
+            "temperature_profile_source": self._temperature_profile_source,
             "optical_depth_corrections": self.get_optical_depth_corrections(),
             "solar_spectral_irradiance_w_m2_per_cm": solar_irradiance,
             "solar_spectrum_source": SOLAR_REFERENCE_SOURCE,
@@ -1320,6 +1748,7 @@ class LayeredAtmosphereSolver:
         enable_scattering: bool = True,
         scattering_cosine: np.ndarray | None = None,
         return_solar_components: bool = False,
+        return_cloud_endmembers: bool = False,
         cloud_effective_radius_um: np.ndarray | None = None,
         cloud_liquid_water_path_g_m2: np.ndarray | None = None,
         aerosol_optical_depth_550: np.ndarray | float | None = None,
@@ -1331,7 +1760,8 @@ class LayeredAtmosphereSolver:
         W/(m²·sr·cm⁻¹)。该接口与 :meth:`spectral_radiance` 使用相同的
         35层传输模型，但共享气体、气溶胶和瑞利光学厚度以提高预览速度。
         ``return_solar_components=True`` 时额外返回单次散射、多次散射和
-        经大气吸收后的地表反射太阳辐亮度。
+        经大气吸收后的地表反射太阳辐亮度。``return_cloud_endmembers=True``
+        时再返回同一足迹的晴空与全云总辐亮度，供有效云量拟合使用。
         """
         wavenumber = np.asarray(wavenumber_cm, dtype=float).reshape(-1)
         if wavenumber.size < 2 or np.any(~np.isfinite(wavenumber)) or np.any(wavenumber <= 0.0):
@@ -1467,7 +1897,7 @@ class LayeredAtmosphereSolver:
         cloudy_tau_ext = clear_tau_ext.copy()
         cloudy_tau_sca = clear_tau_sca.copy()
         cloudy_asymmetry = clear_asymmetry.copy()
-        if np.any(cloud > 0.0):
+        if np.any(cloud > 0.0) or return_cloud_endmembers:
             cloud_extinction_tau, cloud_scattering_tau, cloud_asymmetry = self._cloud_mie_properties(
                 wavenumber,
                 np.where(cloud > 0.0, cloud_re, 10.0),
@@ -1540,13 +1970,28 @@ class LayeredAtmosphereSolver:
             for clear_component, cloudy_component in zip(clear_solar, cloudy_solar)
         )
         reflected = single_scattering + multiple_scattering + surface_reflection
+        clear_total = clear_thermal + sum(clear_solar)
+        cloudy_total = cloudy_thermal + sum(cloudy_solar)
         if return_solar_components:
-            return (
+            components: tuple[np.ndarray, ...] = (
                 np.maximum(thermal, 0.0),
                 np.maximum(reflected, 0.0),
                 single_scattering,
                 multiple_scattering,
                 surface_reflection,
+            )
+            if return_cloud_endmembers:
+                components += (
+                    np.maximum(clear_total, 0.0),
+                    np.maximum(cloudy_total, 0.0),
+                )
+            return components
+        if return_cloud_endmembers:
+            return (
+                np.maximum(thermal, 0.0),
+                np.maximum(reflected, 0.0),
+                np.maximum(clear_total, 0.0),
+                np.maximum(cloudy_total, 0.0),
             )
         return np.maximum(thermal, 0.0), np.maximum(reflected, 0.0)
 
@@ -1561,8 +2006,19 @@ class LayeredAtmosphereSolver:
         view_mu: np.ndarray,
     ) -> np.ndarray:
         """移植ARTESolver.theramlRadMulScatter的热辐射Adding递推。"""
-        tau = np.maximum(tau_extinction[:, ::-1, :], 0.0)
-        scattering = np.clip(tau_scattering[:, ::-1, :], 0.0, tau)
+        vertical_tau = np.maximum(tau_extinction[:, ::-1, :], 0.0)
+        vertical_scattering = np.clip(
+            tau_scattering[:, ::-1, :], 0.0, vertical_tau
+        )
+        # HAPI、气溶胶、瑞利及云层均给出垂直柱分层光学厚度。对于指定
+        # 卫星视线，在平面平行近似下逐层转换成斜程 tau_LOS=tau/mu。
+        # 40°左右的CrIS斜视由此直接增加实际穿越的大气柱，而不是在最终
+        # 辐亮度上简单乘一个投影余弦。
+        mu = np.clip(
+            np.abs(np.asarray(view_mu, dtype=float)), 0.03, 1.0
+        )[:, None, None]
+        tau = vertical_tau / mu
+        scattering = vertical_scattering / mu
         g = np.clip(asymmetry[:, ::-1, :], 0.0, 0.98)
         omega = np.clip(
             np.divide(scattering, tau, out=np.zeros_like(scattering), where=tau > 1e-14),
@@ -1737,9 +2193,7 @@ class LayeredAtmosphereSolver:
                     upward_boundary[:, layer, :]
                     + downward_flux[:, layer, :] * upward_reflectance[:, layer, :]
                 )
-        target_radiance = (
-            upward_flux[:, 1, :] - downward_flux[:, 1, :]
-        ) * np.abs(np.asarray(view_mu, dtype=float))[:, None]
+        target_radiance = upward_flux[:, 1, :] - downward_flux[:, 1, :]
         return np.maximum(target_radiance, 0.0) * 1e4
 
     def _solar_reflection_components(
@@ -2579,9 +3033,15 @@ class EarthIrradianceManager:
         grid = self.modis_manager.get_grid()
         if grid is None:
             raise RuntimeError("请先加载 MODIS 地球环境数据或环境缓存。")
-        required = {"time", "lat", "lon", "alt", "right_ascension", "declination"}
+        required = {"time", "lat", "lon", "alt"}
         if not required.issubset(trajectory.columns):
             raise ValueError(f"轨迹缺少字段：{', '.join(sorted(required - set(trajectory.columns)))}")
+        has_zenith = "solar_zenith" in trajectory.columns
+        has_legacy_solar = {"right_ascension", "declination"}.issubset(
+            trajectory.columns
+        )
+        if not has_zenith and not has_legacy_solar:
+            raise ValueError("轨迹缺少太阳天顶角字段 solar_zenith。")
         params = self._validate_parameters(parameters)
         self.atmosphere.set_upper_atmosphere_temperature_offset(
             params["upper_atmosphere_temperature_offset_k"]
@@ -2651,11 +3111,7 @@ class EarthIrradianceManager:
         mu_view = np.sum(normals * view_direction, axis=-1)
         visible = (mu_view > 0.0) & grid.valid_mask
 
-        # 轨迹只提供赤经/赤纬而没有UTC恒星时。此处把赤经作为地固近似经度；
-        # 若后续轨迹提供UTC，应在轨迹层先转换为太阳地固方向。
-        sun_lon = np.deg2rad(float(sample.get("right_ascension", 0.0)))
-        sun_lat = np.deg2rad(float(sample.get("declination", 0.0)))
-        sun = np.asarray([np.cos(sun_lat) * np.cos(sun_lon), np.cos(sun_lat) * np.sin(sun_lon), np.sin(sun_lat)])
+        sun = solar_direction_from_sample(sample)
         mu0 = np.sum(normals * sun, axis=-1)
 
         lat_step = np.deg2rad(180.0 / grid.latitude.shape[0])
@@ -2686,6 +3142,8 @@ class EarthIrradianceManager:
             "earth_thermal_irradiance": thermal,
             "earth_reflected_irradiance": reflected,
             "earth_total_irradiance": thermal + reflected,
+            "solar_zenith_deg": solar_zenith_from_sample(sample),
+            "solar_azimuth_deg": solar_azimuth_from_sample(sample),
             "visible_cell_count": int(np.count_nonzero(visible)),
             "visible_cloud_fraction": cloud_mean,
             "effective_earth_direction_ecef": direction,
@@ -2713,9 +3171,6 @@ class EarthIrradianceManager:
         辐照度。计算采用分批矢量化，进度以完成的可见网格批次数更新。
         """
         params = self._validate_parameters(parameters)
-        self.atmosphere.set_upper_atmosphere_temperature_offset(
-            params["upper_atmosphere_temperature_offset_k"]
-        )
         mode_text = str(spectral_mode).strip().lower()
         high_resolution = mode_text in {
             "high_resolution", "high-resolution", "高分辨率目标单柱", "高分辨率",
@@ -2723,6 +3178,11 @@ class EarthIrradianceManager:
         absorption_file = params.get("absorption_file", "")
         if absorption_file and self.atmosphere._absorption_tau is None:
             self.atmosphere.load_absorption_optical_depth(absorption_file)
+        # 光学厚度加载时会同步装入同目录的NUCAPS温度，因此温度偏移必须
+        # 在其后应用，才能以实际廓线而非内置标准大气为基准。
+        self.atmosphere.set_upper_atmosphere_temperature_offset(
+            params["upper_atmosphere_temperature_offset_k"]
+        )
         self._configure_optical_depth_correction(params)
 
         lat = np.deg2rad(float(sample["lat"]))
@@ -2745,13 +3205,7 @@ class EarthIrradianceManager:
         mu_view = np.sum(normals * view_direction, axis=-1)
         visible = (mu_view > 0.0) & np.asarray(grid.valid_mask, dtype=bool)
 
-        sun_lon = np.deg2rad(float(sample.get("right_ascension", 0.0)))
-        sun_lat = np.deg2rad(float(sample.get("declination", 0.0)))
-        sun = np.asarray([
-            np.cos(sun_lat) * np.cos(sun_lon),
-            np.cos(sun_lat) * np.sin(sun_lon),
-            np.sin(sun_lat),
-        ])
+        sun = solar_direction_from_sample(sample)
         mu0 = np.sum(normals * sun, axis=-1)
         lat_step = np.deg2rad(180.0 / grid.latitude.shape[0])
         lon_step = np.deg2rad(360.0 / grid.latitude.shape[1])
@@ -2856,7 +3310,44 @@ class EarthIrradianceManager:
             if params["enable_cloud"]
             else np.zeros_like(grid.cloud_fraction, dtype=float)
         )
+        cloud_temperature = np.asarray(grid.cloud_top_temperature_k, dtype=float)
+        cloud_height = np.asarray(grid.cloud_top_height_m, dtype=float)
         cloud_re, cloud_lwp = self.modis_manager._grid_cloud_microphysics(grid)
+        cloud_fraction_source = (
+            "地球环境云产品网格" if params["enable_cloud"] else "云计算已关闭"
+        )
+        cloud_fit_pending = False
+        nucaps_cloud: dict[str, Any] | None = None
+        if high_resolution and params["enable_cloud"]:
+            cloud_fraction = cloud_fraction.copy()
+            cloud_temperature = cloud_temperature.copy()
+            cloud_height = cloud_height.copy()
+            fitted_fraction = params.get("effective_cloud_fraction")
+            if fitted_fraction is not None:
+                cloud_fraction.reshape(-1)[selected] = float(fitted_fraction)
+                cloud_fraction_source = (
+                    params.get("cloud_fraction_source")
+                    or "卫星光谱拟合有效云量"
+                )
+            else:
+                nucaps_cloud = self._same_footprint_nucaps_cloud(sample, params)
+                if nucaps_cloud is not None:
+                    cloud_fraction.reshape(-1)[selected] = float(nucaps_cloud["fraction"])
+                    if np.isfinite(float(nucaps_cloud["top_temperature_k"])):
+                        cloud_temperature.reshape(-1)[selected] = float(
+                            nucaps_cloud["top_temperature_k"]
+                        )
+                    cloud_height.reshape(-1)[selected] = float(
+                        nucaps_cloud["top_height_m"]
+                    )
+                    cloud_fraction_source = str(nucaps_cloud["source"])
+                else:
+                    # 全球云图的单个网格（例如99.33%）不等于CrIS视场有效云量。
+                    # 先输出晴空/全云端元，以晴空作为未标定初值；导入卫星谱后
+                    # SpectrumValidationManager 会在两个端元之间拟合有效云量。
+                    cloud_fraction.reshape(-1)[selected] = 0.0
+                    cloud_fraction_source = "待CrIS/卫星光谱拟合（晴空初值）"
+                    cloud_fit_pending = True
         opac_aerosol_type = self.modis_manager.opac_aerosol_type_grid(
             grid.surface_type, grid.latitude
         )
@@ -2866,8 +3357,8 @@ class EarthIrradianceManager:
             "surface_albedo": np.asarray(grid.surface_albedo, dtype=float).reshape(-1),
             "surface_emissivity": np.asarray(grid.surface_emissivity, dtype=float).reshape(-1),
             "cloud_fraction": cloud_fraction.reshape(-1),
-            "cloud_temperature_k": np.asarray(grid.cloud_top_temperature_k, dtype=float).reshape(-1),
-            "cloud_height_m": np.asarray(grid.cloud_top_height_m, dtype=float).reshape(-1),
+            "cloud_temperature_k": cloud_temperature.reshape(-1),
+            "cloud_height_m": cloud_height.reshape(-1),
             "cloud_effective_radius_um": cloud_re.reshape(-1),
             "cloud_liquid_water_path_g_m2": cloud_lwp.reshape(-1),
             "solar_mu": mu0.reshape(-1),
@@ -2875,6 +3366,26 @@ class EarthIrradianceManager:
             "scattering_cosine": np.sum(view_direction * sun, axis=-1).reshape(-1),
             "aerosol_type": opac_aerosol_type.reshape(-1),
         }
+        if high_resolution:
+            # 高分辨率验证表示一个指定足迹，而不是卫星下方的地球盘积分。
+            # 用产品给出的传感器观测角覆盖由“卫星位于输入经纬度正上方”
+            # 推导出的垂直几何；方位角同时进入太阳—观测散射夹角。
+            view_zenith_deg = float(sample.get("view_zenith", 0.0))
+            view_azimuth_deg = float(sample.get("view_azimuth", 0.0))
+            specified_view_mu = float(np.cos(np.deg2rad(view_zenith_deg)))
+            view_direction_at_footprint = local_direction_from_zenith_azimuth(
+                float(sample["lat"]),
+                float(sample["lon"]),
+                view_zenith_deg,
+                view_azimuth_deg,
+            )
+            flat_fields["solar_mu"][selected] = float(np.cos(np.deg2rad(
+                solar_zenith_from_sample(sample)
+            )))
+            flat_fields["view_mu"][selected] = specified_view_mu
+            flat_fields["scattering_cosine"][selected] = float(
+                np.dot(view_direction_at_footprint, sun)
+            )
         if aerosol_aod is not None:
             flat_fields["aerosol_optical_depth_550"] = np.asarray(aerosol_aod, dtype=float).reshape(-1)
         high_resolution_fields = {
@@ -2885,6 +3396,9 @@ class EarthIrradianceManager:
         single_scattering_wavenumber = np.zeros(wavenumber.shape, dtype=float)
         multiple_scattering_wavenumber = np.zeros(wavenumber.shape, dtype=float)
         surface_reflection_wavenumber = np.zeros(wavenumber.shape, dtype=float)
+        cloud_clear_total_wavenumber = np.zeros(wavenumber.shape, dtype=float)
+        cloud_overcast_total_wavenumber = np.zeros(wavenumber.shape, dtype=float)
+        produce_cloud_endmembers = bool(high_resolution and params["enable_cloud"])
         custom_spectral_grid = (
             requested_wavelength is not None or requested_wavenumber_grid is not None
         )
@@ -2910,6 +3424,7 @@ class EarthIrradianceManager:
                     visibility_km=params["visibility_km"],
                     enable_scattering=params["enable_scattering"],
                     return_solar_components=True,
+                    return_cloud_endmembers=produce_cloud_endmembers,
                 )
                 for destination, values in zip(
                     (
@@ -2922,6 +3437,9 @@ class EarthIrradianceManager:
                     result,
                 ):
                     destination[spectral_slice] = values[0]
+                if produce_cloud_endmembers:
+                    cloud_clear_total_wavenumber[spectral_slice] = result[5][0]
+                    cloud_overcast_total_wavenumber[spectral_slice] = result[6][0]
                 if progress_callback is not None and progress_callback(batch_index, total_batches) is False:
                     raise RuntimeError("大气辐射光谱预览已取消。")
         elif custom_spectral_grid:
@@ -3008,6 +3526,8 @@ class EarthIrradianceManager:
         single_scattering_wavelength = single_scattering_wavenumber[::-1] * jacobian
         multiple_scattering_wavelength = multiple_scattering_wavenumber[::-1] * jacobian
         surface_reflection_wavelength = surface_reflection_wavenumber[::-1] * jacobian
+        cloud_clear_total_wavelength = cloud_clear_total_wavenumber[::-1] * jacobian
+        cloud_overcast_total_wavelength = cloud_overcast_total_wavenumber[::-1] * jacobian
         summary_weight = weights / max(float(np.sum(weights)), 1e-30)
         representative_cloud_fraction = float(
             np.sum(np.asarray(high_resolution_fields["cloud_fraction"], dtype=float) * summary_weight)
@@ -3038,6 +3558,10 @@ class EarthIrradianceManager:
             "solar_multiple_scattering_spectral_irradiance": multiple_scattering_wavelength,
             "solar_surface_reflection_spectral_irradiance": surface_reflection_wavelength,
             "earth_total_spectral_irradiance": thermal_wavelength + reflected_wavelength,
+            "cloud_clear_total_spectral_wavenumber": cloud_clear_total_wavenumber,
+            "cloud_overcast_total_spectral_wavenumber": cloud_overcast_total_wavenumber,
+            "cloud_clear_total_spectral_irradiance": cloud_clear_total_wavelength,
+            "cloud_overcast_total_spectral_irradiance": cloud_overcast_total_wavelength,
             "earth_thermal_irradiance": thermal_integral,
             "earth_reflected_irradiance": reflected_integral,
             "solar_single_scattering_irradiance": single_scattering_integral,
@@ -3051,6 +3575,20 @@ class EarthIrradianceManager:
             "target_latitude_deg": float(sample["lat"]),
             "target_longitude_deg": float(sample["lon"]),
             "target_altitude_m": altitude_m,
+            "solar_zenith_deg": solar_zenith_from_sample(sample),
+            "solar_azimuth_deg": solar_azimuth_from_sample(sample),
+            "satellite_zenith_deg": (
+                float(sample.get("view_zenith", 0.0)) if high_resolution else None
+            ),
+            "satellite_azimuth_deg": (
+                float(sample.get("view_azimuth", 0.0)) if high_resolution else None
+            ),
+            "view_air_mass_factor": (
+                float(1.0 / max(np.cos(np.deg2rad(
+                    float(sample.get("view_zenith", 0.0))
+                )), 0.03))
+                if high_resolution else None
+            ),
             "uses_total_optical_depth": self.atmosphere._absorption_tau is not None,
             "optical_depth_correction_enabled": bool(
                 params.get("enable_optical_depth_correction", False)
@@ -3059,6 +3597,8 @@ class EarthIrradianceManager:
             "upper_atmosphere_temperature_offset_k": float(
                 self.atmosphere._upper_atmosphere_temperature_offset_k
             ),
+            "temperature_profile_source": self.atmosphere._temperature_profile_source,
+            "layer_temperature_k": self.atmosphere.temperature_k.copy(),
             "preview_mode": (
                 "high_resolution" if high_resolution
                 else "detector_earth_disk" if custom_spectral_grid
@@ -3070,6 +3610,10 @@ class EarthIrradianceManager:
             "representative_cloud_fraction": representative_cloud_fraction,
             "representative_cloud_effective_radius_um": representative_cloud_re,
             "representative_cloud_liquid_water_path_g_m2": representative_cloud_lwp,
+            "cloud_fraction_source": cloud_fraction_source,
+            "cloud_fraction_fit_pending": cloud_fit_pending,
+            "cloud_model_enabled": bool(params["enable_cloud"]),
+            "nucaps_same_footprint_cloud": nucaps_cloud,
             **subpoint_environment,
             "visibility_km": float(params["visibility_km"]),
             **aerosol_info,
@@ -3122,6 +3666,16 @@ class EarthIrradianceManager:
         return result
 
     def _validate_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        effective_cloud_fraction = parameters.get("effective_cloud_fraction")
+        if effective_cloud_fraction in (None, ""):
+            effective_cloud_fraction = None
+        else:
+            effective_cloud_fraction = float(effective_cloud_fraction)
+            if (
+                not np.isfinite(effective_cloud_fraction)
+                or not 0.0 <= effective_cloud_fraction <= 1.0
+            ):
+                raise ValueError("有效云量必须位于0～1之间。")
         return {
             "visibility_km": max(float(parameters.get("visibility_km", 23.0)), 1.0),
             "enable_cloud": bool(parameters.get("enable_cloud", True)),
@@ -3139,6 +3693,16 @@ class EarthIrradianceManager:
                 -15.0,
                 15.0,
             )),
+            "effective_cloud_fraction": effective_cloud_fraction,
+            "cloud_fraction_source": str(
+                parameters.get("cloud_fraction_source", "")
+            ).strip(),
+            "nucaps_cloud_file": str(
+                parameters.get("nucaps_cloud_file", "")
+            ).strip(),
+            "nucaps_cloud_for_index": int(
+                parameters.get("nucaps_cloud_for_index", 0)
+            ),
             "use_merra2_aerosol": bool(parameters.get("use_merra2_aerosol", False)),
             "merra2_aerosol_file": str(parameters.get("merra2_aerosol_file", "")),
             "merra2_time_offset_hours": float(parameters.get("merra2_time_offset_hours", 0.0)),
@@ -3152,6 +3716,154 @@ class EarthIrradianceManager:
         if not corrections:
             raise ValueError("已启用总光学厚度修正，但尚未配置修正波段。")
         self.atmosphere.apply_optical_depth_corrections(corrections)
+
+    @staticmethod
+    def _great_circle_distance_km(
+        latitude_a_deg: float,
+        longitude_a_deg: float,
+        latitude_b_deg: float,
+        longitude_b_deg: float,
+    ) -> float:
+        latitude_a, latitude_b = np.deg2rad([latitude_a_deg, latitude_b_deg])
+        delta_latitude = latitude_b - latitude_a
+        delta_longitude = np.deg2rad(
+            ((longitude_b_deg - longitude_a_deg + 180.0) % 360.0) - 180.0
+        )
+        haversine = (
+            np.sin(0.5 * delta_latitude) ** 2
+            + np.cos(latitude_a)
+            * np.cos(latitude_b)
+            * np.sin(0.5 * delta_longitude) ** 2
+        )
+        return float(2.0 * 6371.0 * np.arcsin(np.sqrt(np.clip(haversine, 0.0, 1.0))))
+
+    def _resolve_nucaps_cloud_source(
+        self, parameters: dict[str, Any]
+    ) -> tuple[Path, int] | None:
+        configured = str(parameters.get("nucaps_cloud_file", "")).strip()
+        if configured:
+            configured_path = Path(configured).expanduser()
+            if configured_path.is_file():
+                return configured_path.resolve(), int(
+                    parameters.get("nucaps_cloud_for_index", 0)
+                )
+
+        absorption = str(parameters.get("absorption_file", "")).strip()
+        if not absorption:
+            return None
+        manifest_path = Path(absorption).expanduser().resolve().parent / "calculation_manifest.json"
+        if not manifest_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            profile = manifest.get("profile", {})
+            source = Path(str(profile.get("source_file", ""))).expanduser()
+            if not source.is_absolute():
+                source = manifest_path.parent / source
+            if source.suffix.lower() not in {".nc", ".nc4"} or not source.is_file():
+                return None
+            return source.resolve(), int(profile.get("for_index", 0))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _same_footprint_nucaps_cloud(
+        self,
+        sample: dict[str, Any],
+        parameters: dict[str, Any],
+        maximum_distance_km: float = 30.0,
+    ) -> dict[str, Any] | None:
+        """读取用于气体廓线的同一 NUCAPS FOR 云量和云顶状态。
+
+        只有 FOR 中心距目标不超过一个 NUCAPS 足迹尺度时才采用，避免把
+        另一轨道或另一地区的云参数误当成当前 CrIS 视场云量。
+        """
+        resolved = self._resolve_nucaps_cloud_source(parameters)
+        if resolved is None:
+            return None
+        source, for_index = resolved
+        try:
+            from netCDF4 import Dataset
+        except ImportError:
+            return None
+        try:
+            with Dataset(source, "r") as dataset:
+                required = {
+                    "Latitude", "Longitude", "Cloud_Top_Fraction",
+                    "Cloud_Top_Pressure",
+                }
+                if not required.issubset(dataset.variables):
+                    return None
+                latitude = float(np.ma.asarray(
+                    dataset.variables["Latitude"][for_index], dtype=float
+                ).filled(np.nan))
+                longitude = float(np.ma.asarray(
+                    dataset.variables["Longitude"][for_index], dtype=float
+                ).filled(np.nan))
+                distance = self._great_circle_distance_km(
+                    float(sample["lat"]), float(sample["lon"]), latitude, longitude
+                )
+                if not np.isfinite(distance) or distance > maximum_distance_km:
+                    return None
+
+                fractions = np.ma.asarray(
+                    dataset.variables["Cloud_Top_Fraction"][for_index], dtype=float
+                ).filled(np.nan).reshape(-1)
+                pressures = np.ma.asarray(
+                    dataset.variables["Cloud_Top_Pressure"][for_index], dtype=float
+                ).filled(np.nan).reshape(-1)
+                valid_fraction = np.isfinite(fractions) & (fractions >= 0.0) & (fractions <= 1.0)
+                if not np.any(valid_fraction):
+                    return None
+                effective_fraction = float(np.max(fractions[valid_fraction]))
+                paired = valid_fraction & np.isfinite(pressures) & (pressures > 0.0)
+                if effective_fraction <= 0.0 or not np.any(paired):
+                    cloud_pressure_hpa = np.nan
+                    cloud_height_m = 0.0
+                    cloud_temperature_k = np.nan
+                else:
+                    paired_indices = np.flatnonzero(paired)
+                    dominant = int(paired_indices[np.argmax(fractions[paired])])
+                    cloud_pressure_hpa = float(pressures[dominant])
+                    cloud_height_m = float(np.clip(
+                        44_330.0 * (1.0 - (cloud_pressure_hpa / 1013.25) ** 0.1903),
+                        0.0,
+                        20_000.0,
+                    ))
+                    cloud_temperature_k = np.nan
+                    if {"Pressure", "Temperature"}.issubset(dataset.variables):
+                        profile_pressure = np.ma.asarray(
+                            dataset.variables["Pressure"][for_index], dtype=float
+                        ).filled(np.nan).reshape(-1)
+                        profile_temperature = np.ma.asarray(
+                            dataset.variables["Temperature"][for_index], dtype=float
+                        ).filled(np.nan).reshape(-1)
+                        valid_profile = (
+                            np.isfinite(profile_pressure)
+                            & (profile_pressure > 0.0)
+                            & np.isfinite(profile_temperature)
+                            & (profile_temperature > 0.0)
+                        )
+                        if np.count_nonzero(valid_profile) >= 2:
+                            order = np.argsort(profile_pressure[valid_profile])
+                            cloud_temperature_k = float(np.interp(
+                                cloud_pressure_hpa,
+                                profile_pressure[valid_profile][order],
+                                profile_temperature[valid_profile][order],
+                            ))
+                return {
+                    "fraction": effective_fraction,
+                    "top_pressure_hpa": cloud_pressure_hpa,
+                    "top_height_m": cloud_height_m,
+                    "top_temperature_k": cloud_temperature_k,
+                    "source": "NUCAPS同足迹Cloud_Top_Fraction",
+                    "source_file": str(source),
+                    "for_index": int(for_index),
+                    "latitude_deg": latitude,
+                    "longitude_deg": longitude,
+                    "distance_km": distance,
+                }
+        except (IndexError, KeyError, OSError, TypeError, ValueError):
+            return None
 
     def _aerosol_for_grid(
         self,
